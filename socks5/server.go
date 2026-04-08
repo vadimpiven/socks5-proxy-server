@@ -339,9 +339,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				}
 			}
 			s.cfg.Logger.Warn("accept failed; retrying", "err", err, "delay", tempDelay)
+			timer := time.NewTimer(tempDelay)
 			select {
-			case <-time.After(tempDelay):
+			case <-timer.C:
 			case <-ctx.Done():
+				timer.Stop()
 				wg.Wait()
 				return nil
 			}

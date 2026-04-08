@@ -171,6 +171,9 @@ func parseAddrFromBytes(b []byte) (AddrSpec, int, error) {
 func appendAddr(buf []byte, spec AddrSpec) []byte {
 	switch {
 	case spec.Domain != "":
+		if len(spec.Domain) > 255 {
+			panic("socks5: domain name exceeds 255 bytes")
+		}
 		buf = append(buf, addrTypeDomain, byte(len(spec.Domain)))
 		buf = append(buf, spec.Domain...)
 	case spec.IP.Is4():

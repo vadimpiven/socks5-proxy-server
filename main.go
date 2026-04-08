@@ -6,8 +6,8 @@
 // with optional username/password authentication per RFC 1928 and RFC 1929.
 //
 // By default private, loopback, and link-local destinations are blocked
-// (see [socks5.DenyPrivateDestinations]). Use -private for deployments that
-// intentionally proxy to internal infrastructure.
+// (see [socks5.Config.AllowPrivateDestinations]). Use -private for deployments
+// that intentionally proxy to internal infrastructure.
 //
 // Usage:
 //

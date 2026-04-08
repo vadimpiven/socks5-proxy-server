@@ -21,6 +21,7 @@ import (
 // TestReadAddr_EmptyDomain verifies that DLEN=0 is rejected; the RFC diagram
 // marks the DOMAINNAME field as "1 to 255" octets.
 func TestReadAddr_EmptyDomain(t *testing.T) {
+	t.Parallel()
 	input := []byte{addrTypeDomain, 0x00, 0x00, 0x50}
 	_, err := readAddr(bytes.NewReader(input))
 	if !errors.Is(err, errEmptyDomainName) {
@@ -31,6 +32,7 @@ func TestReadAddr_EmptyDomain(t *testing.T) {
 // TestReadAddr_UnsupportedATYP verifies that an unknown ATYP byte returns
 // errUnsupportedAddrType, which the session maps to reply 0x08.
 func TestReadAddr_UnsupportedATYP(t *testing.T) {
+	t.Parallel()
 	input := []byte{0x02, 0x00, 0x00} // ATYP=0x02 is not defined by RFC 1928
 	_, err := readAddr(bytes.NewReader(input))
 	if !errors.Is(err, errUnsupportedAddrType) {
@@ -41,6 +43,7 @@ func TestReadAddr_UnsupportedATYP(t *testing.T) {
 // TestReadAddr_IPv4MappedNormalised verifies that an IPv6-encoded IPv4-mapped
 // address (::ffff:a.b.c.d) is stored as plain IPv4 after parsing.
 func TestReadAddr_IPv4MappedNormalised(t *testing.T) {
+	t.Parallel()
 	mapped := netip.MustParseAddr("::ffff:1.2.3.4")
 	b := mapped.As16()
 	input := append([]byte{addrTypeIPv6}, b[:]...)
@@ -62,6 +65,7 @@ func TestReadAddr_IPv4MappedNormalised(t *testing.T) {
 // is exercised here; the integration tests cover the full relay pipeline.
 
 func TestParseAddrFromBytes_IPv4(t *testing.T) {
+	t.Parallel()
 	b := []byte{addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50} // 1.2.3.4:80
 	addr, n, err := parseAddrFromBytes(b)
 	if err != nil {
@@ -79,6 +83,7 @@ func TestParseAddrFromBytes_IPv4(t *testing.T) {
 }
 
 func TestParseAddrFromBytes_IPv6(t *testing.T) {
+	t.Parallel()
 	ip6 := netip.MustParseAddr("2001:db8::1")
 	a16 := ip6.As16()
 	b := append([]byte{addrTypeIPv6}, a16[:]...)
@@ -99,6 +104,7 @@ func TestParseAddrFromBytes_IPv6(t *testing.T) {
 }
 
 func TestParseAddrFromBytes_IPv4MappedNormalised(t *testing.T) {
+	t.Parallel()
 	mapped := netip.MustParseAddr("::ffff:1.2.3.4")
 	a16 := mapped.As16()
 	b := append([]byte{addrTypeIPv6}, a16[:]...)
@@ -116,6 +122,7 @@ func TestParseAddrFromBytes_IPv4MappedNormalised(t *testing.T) {
 }
 
 func TestParseAddrFromBytes_Domain(t *testing.T) {
+	t.Parallel()
 	domain := "example.com"
 	b := []byte{addrTypeDomain, byte(len(domain))}
 	b = append(b, []byte(domain)...)
@@ -137,6 +144,7 @@ func TestParseAddrFromBytes_Domain(t *testing.T) {
 }
 
 func TestParseAddrFromBytes_EmptyDomain(t *testing.T) {
+	t.Parallel()
 	b := []byte{addrTypeDomain, 0x00, 0x00, 0x50}
 	_, _, err := parseAddrFromBytes(b)
 	if !errors.Is(err, errEmptyDomainName) {
@@ -145,6 +153,7 @@ func TestParseAddrFromBytes_EmptyDomain(t *testing.T) {
 }
 
 func TestParseAddrFromBytes_UnsupportedATYP(t *testing.T) {
+	t.Parallel()
 	b := []byte{0x02, 0x00, 0x00} // ATYP=0x02 is not defined
 	_, _, err := parseAddrFromBytes(b)
 	if !errors.Is(err, errUnsupportedAddrType) {
@@ -153,6 +162,7 @@ func TestParseAddrFromBytes_UnsupportedATYP(t *testing.T) {
 }
 
 func TestParseAddrFromBytes_Truncated(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		b    []byte
@@ -176,6 +186,7 @@ func TestParseAddrFromBytes_Truncated(t *testing.T) {
 
 // TestWriteReply_RSVIsZero verifies RFC 1928 §6: RSV must be 0x00 in every reply.
 func TestWriteReply_RSVIsZero(t *testing.T) {
+	t.Parallel()
 	for _, code := range []byte{
 		replySuccess, replyGeneralFailure, replyNotAllowed,
 		replyNetUnreachable, replyHostUnreachable, replyConnRefused,
@@ -192,6 +203,7 @@ func TestWriteReply_RSVIsZero(t *testing.T) {
 // TestWriteReply_ZeroAddrIsIPv4 verifies that a zero AddrSpec (used for all
 // error replies) encodes as ATYP=IPv4 / 0.0.0.0:0.
 func TestWriteReply_ZeroAddrIsIPv4(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	writeReply(&buf, replyGeneralFailure, AddrSpec{})
 	got := buf.Bytes()
@@ -208,6 +220,7 @@ func TestWriteReply_ZeroAddrIsIPv4(t *testing.T) {
 // TestAddrSpec_Roundtrip verifies that appendAddr + readAddr are inverses
 // across all three address families.
 func TestAddrSpec_Roundtrip(t *testing.T) {
+	t.Parallel()
 	cases := []AddrSpec{
 		{IP: netip.MustParseAddr("1.2.3.4"), Port: 80},
 		{IP: netip.MustParseAddr("::1"), Port: 443},
@@ -233,6 +246,7 @@ func TestAddrSpec_Roundtrip(t *testing.T) {
 
 // TestReplyFromError_ConnRefused verifies that ECONNREFUSED maps to reply 0x05.
 func TestReplyFromError_ConnRefused(t *testing.T) {
+	t.Parallel()
 	// Listen then immediately close — dialing that address gives ECONNREFUSED.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -253,6 +267,7 @@ func TestReplyFromError_ConnRefused(t *testing.T) {
 // TestReplyFromError_Generic verifies that an unrecognised error maps to reply
 // 0x01 (general SOCKS server failure).
 func TestReplyFromError_Generic(t *testing.T) {
+	t.Parallel()
 	err := errors.New("some unknown network error")
 	if got := replyFromError(err); got != replyGeneralFailure {
 		t.Fatalf("replyFromError = %#x, want %#x (general failure)", got, replyGeneralFailure)

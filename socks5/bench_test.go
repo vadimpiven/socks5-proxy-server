@@ -69,7 +69,8 @@ func BenchmarkHandshake_UserPass(b *testing.B) {
 	echo := startEchoServer(b)
 	defer echo.Close()
 	proxyAddr, cancel := startProxy(b, Config{
-		Authenticators: []Authenticator{UserPassAuth("bench", "bench")},
+		Authenticators:           []Authenticator{UserPassAuth("bench", "bench")},
+		AllowPrivateDestinations: true,
 	})
 	defer cancel()
 

@@ -5,6 +5,7 @@ package socks5
 import (
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -24,6 +25,7 @@ func pipeWithDeadline(t *testing.T) (client, server net.Conn) {
 // TestUserPassAuth verifies that [UserPassAuth] returns a working RFC 1929
 // authenticator that accepts the configured credential pair.
 func TestUserPassAuth(t *testing.T) {
+	t.Parallel()
 	client, server := pipeWithDeadline(t)
 	auth := UserPassAuth("alice", "secret")
 
@@ -57,6 +59,7 @@ func TestUserPassAuth(t *testing.T) {
 // TestUserPassAuthMulti verifies that [UserPassAuthMulti] accepts any
 // credential pair from the provided map.
 func TestUserPassAuthMulti(t *testing.T) {
+	t.Parallel()
 	creds := map[string]string{"alice": "secret", "bob": "pass"}
 
 	for user, pass := range creds {
@@ -93,6 +96,7 @@ func TestUserPassAuthMulti(t *testing.T) {
 // TestUserPassAuth_BadSubVersion verifies that the server rejects a
 // sub-negotiation whose VER field is not 0x01 (RFC 1929 §2).
 func TestUserPassAuth_BadSubVersion(t *testing.T) {
+	t.Parallel()
 	client, server := pipeWithDeadline(t)
 	a := UserPassAuth("u", "p")
 
@@ -114,6 +118,7 @@ func TestUserPassAuth_BadSubVersion(t *testing.T) {
 // TestUserPassAuth_ZeroLengthUsername verifies that ULEN=0 is rejected with
 // STATUS=0x01 (RFC 1929 §2: ULEN is "1 to 255").
 func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
+	t.Parallel()
 	client, server := pipeWithDeadline(t)
 	a := UserPassAuth("u", "p")
 
@@ -143,6 +148,7 @@ func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
 // TestUserPassAuth_ZeroLengthPassword verifies that PLEN=0 is rejected with
 // STATUS=0x01 (RFC 1929 §2: PLEN is "1 to 255").
 func TestUserPassAuth_ZeroLengthPassword(t *testing.T) {
+	t.Parallel()
 	client, server := pipeWithDeadline(t)
 	a := UserPassAuth("u", "p")
 
@@ -167,7 +173,45 @@ func TestUserPassAuth_ZeroLengthPassword(t *testing.T) {
 	}
 }
 
+// TestUserPassAuth_MaxLengthCredentials verifies that the maximum-length
+// credentials (ULEN=255, PLEN=255) allowed by RFC 1929 §2 are accepted.
+func TestUserPassAuth_MaxLengthCredentials(t *testing.T) {
+	t.Parallel()
+
+	// RFC 1929 §2: UNAME and PASSWD are "1 to 255" octets each.
+	longUser := strings.Repeat("u", 255)
+	longPass := strings.Repeat("p", 255)
+
+	client, server := pipeWithDeadline(t)
+	auth := UserPassAuth(longUser, longPass)
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := auth.Authenticate(server)
+		errc <- err
+	}()
+
+	pkt := []byte{authSubVersion, 255}
+	pkt = append(pkt, longUser...)
+	pkt = append(pkt, 255)
+	pkt = append(pkt, longPass...)
+	client.Write(pkt)
+
+	resp := make([]byte, 2)
+	io.ReadFull(client, resp)
+	if resp[0] != authSubVersion {
+		t.Fatalf("auth response VER = %#x, want 0x01", resp[0])
+	}
+	if resp[1] != authSuccess {
+		t.Fatalf("STATUS = %#x, want 0x00 (success) for max-length credentials", resp[1])
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+}
+
 func TestStaticCredentials(t *testing.T) {
+	t.Parallel()
 	s := StaticCredentials{Username: "alice", Password: "secret"}
 	if !s.Valid("alice", "secret") {
 		t.Error("expected valid for correct credentials")
@@ -181,6 +225,7 @@ func TestStaticCredentials(t *testing.T) {
 }
 
 func TestMapCredentials(t *testing.T) {
+	t.Parallel()
 	m := MapCredentials{"alice": "secret", "bob": "pass"}
 	if !m.Valid("alice", "secret") {
 		t.Error("expected valid")

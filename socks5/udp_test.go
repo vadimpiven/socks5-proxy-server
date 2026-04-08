@@ -18,6 +18,7 @@ import (
 // through a normal client.
 
 func TestParseUDPHeader_TooShort(t *testing.T) {
+	t.Parallel()
 	_, _, err := parseUDPHeader([]byte{0x00, 0x00, 0x00})
 	if err == nil {
 		t.Fatal("expected error for datagram shorter than minimum header")
@@ -27,6 +28,7 @@ func TestParseUDPHeader_TooShort(t *testing.T) {
 // TestParseUDPHeader_NonZeroRSV verifies that datagrams with a non-zero RSV
 // field are rejected. RFC 1928 §7 specifies RSV = X'0000'.
 func TestParseUDPHeader_NonZeroRSV(t *testing.T) {
+	t.Parallel()
 	b := []byte{0x00, 0x01, 0x00, addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50}
 	_, _, err := parseUDPHeader(b)
 	if err == nil {
@@ -38,6 +40,7 @@ func TestParseUDPHeader_NonZeroRSV(t *testing.T) {
 // are rejected. RFC 1928 §7: "An implementation that does not support
 // fragmentation MUST drop any datagram whose FRAG field is other than X'00'."
 func TestParseUDPHeader_FragmentedDropped(t *testing.T) {
+	t.Parallel()
 	b := []byte{0x00, 0x00, 0x01, addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50}
 	_, _, err := parseUDPHeader(b)
 	if err == nil {
@@ -49,6 +52,7 @@ func TestParseUDPHeader_FragmentedDropped(t *testing.T) {
 // for an IPv4-mapped IPv6 source (::ffff:a.b.c.d) uses ATYP=0x01 (IPv4).
 // Clients that don't handle IPv6 can parse the source address correctly.
 func TestAppendUDPResponse_IPv4MappedNormalised(t *testing.T) {
+	t.Parallel()
 	from := netip.MustParseAddrPort("[::ffff:192.0.2.1]:9")
 	var dst [udpResponseBufSize]byte
 	appendUDPResponse(dst[:], from, nil)
@@ -62,6 +66,7 @@ func TestAppendUDPResponse_IPv4MappedNormalised(t *testing.T) {
 // default case and the RFC 1928 §6 error-reply convention. This exercises the
 // default branch added by the appendUDPResponse refactor.
 func TestAppendUDPResponse_ZeroAddr(t *testing.T) {
+	t.Parallel()
 	var from netip.AddrPort // zero value: invalid addr, port 0
 	var dst [udpResponseBufSize]byte
 	n := appendUDPResponse(dst[:], from, []byte("data"))
@@ -88,6 +93,7 @@ func TestAppendUDPResponse_ZeroAddr(t *testing.T) {
 // TestUDPHeaderRoundtrip verifies that appendUDPResponse and parseUDPHeader
 // are inverses of each other across all address families.
 func TestUDPHeaderRoundtrip(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		from    netip.AddrPort
 		payload string
@@ -194,6 +200,7 @@ func doUDPAssociate(t *testing.T, proxyAddr string) (ctrl net.Conn, relayAddr *n
 // encapsulates the reply with a SOCKS5 header, and reports the correct source
 // address (RFC 1928 §7).
 func TestUDPAssociate_EchoRoundtrip(t *testing.T) {
+	t.Parallel()
 	echoAddr := startUDPEchoServer(t)
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -244,6 +251,7 @@ func TestUDPAssociate_EchoRoundtrip(t *testing.T) {
 // load balancers and NAT devices that reply from a different port than they
 // listen on.
 func TestUDPAssociate_PortChangingRemote(t *testing.T) {
+	t.Parallel()
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
 
@@ -317,6 +325,7 @@ func (r fixedIPResolver) Resolve(_ context.Context, _ string) (netip.Addr, error
 // A fixed resolver is used so the test is independent of system DNS and
 // address-family selection.
 func TestUDPAssociate_DomainDestination(t *testing.T) {
+	t.Parallel()
 	echoAddr := startUDPEchoServer(t)
 
 	// Use a resolver that always returns 127.0.0.1 so the relay stays on
@@ -373,6 +382,7 @@ func TestUDPAssociate_DomainDestination(t *testing.T) {
 // is accepted, every inbound datagram whose source IP ≠ clientIP must be
 // silently dropped with no reply.
 func TestUDPRelay_DropsDatagramFromWrongSourceIP(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -413,6 +423,7 @@ func TestUDPRelay_DropsDatagramFromWrongSourceIP(t *testing.T) {
 // TestUDPAssociate_AssociationEndsWithTCP verifies RFC 1928 §7: the UDP
 // association must terminate when the TCP control connection closes.
 func TestUDPAssociate_AssociationEndsWithTCP(t *testing.T) {
+	t.Parallel()
 	echoAddr := startUDPEchoServer(t)
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()

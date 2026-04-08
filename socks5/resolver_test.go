@@ -8,6 +8,7 @@ import (
 )
 
 func TestDefaultResolver_Localhost(t *testing.T) {
+	t.Parallel()
 	r := DefaultResolver{}
 	addr, err := r.Resolve(context.Background(), "localhost")
 	if err != nil {
@@ -22,6 +23,7 @@ func TestDefaultResolver_Localhost(t *testing.T) {
 }
 
 func TestDefaultResolver_InvalidHost(t *testing.T) {
+	t.Parallel()
 	r := DefaultResolver{}
 	_, err := r.Resolve(context.Background(), "this.host.does.not.exist.invalid.")
 	if err == nil {

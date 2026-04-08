@@ -10,6 +10,7 @@ import (
 // TestAddrSpec_String verifies String() for all three address families (IPv4,
 // IPv6, domain). The output must be a valid "host:port" argument for net.Dial.
 func TestAddrSpec_String(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		spec AddrSpec
 		want string
@@ -29,6 +30,7 @@ func TestAddrSpec_String(t *testing.T) {
 // netip.AddrPort for IP destinations and a zero (invalid) value for domain
 // destinations (whose IP is not yet resolved at request time).
 func TestAddrSpec_AddrPort(t *testing.T) {
+	t.Parallel()
 	ip := netip.MustParseAddr("1.2.3.4")
 	spec := AddrSpec{IP: ip, Port: 80}
 	ap := spec.AddrPort()
@@ -54,6 +56,7 @@ func TestAddrSpec_AddrPort(t *testing.T) {
 // TestIsPrivateAddr_BlockedRanges verifies that loopback, RFC 1918, link-local,
 // and unspecified addresses are classified as private.
 func TestIsPrivateAddr_BlockedRanges(t *testing.T) {
+	t.Parallel()
 	blocked := []string{
 		"127.0.0.1",       // IPv4 loopback
 		"127.0.0.255",     // IPv4 loopback subnet
@@ -80,6 +83,7 @@ func TestIsPrivateAddr_BlockedRanges(t *testing.T) {
 // TestIsPrivateAddr_AllowedRanges verifies that public IP addresses are not
 // classified as private.
 func TestIsPrivateAddr_AllowedRanges(t *testing.T) {
+	t.Parallel()
 	public := []string{
 		"1.1.1.1",
 		"8.8.8.8",
@@ -98,6 +102,7 @@ func TestIsPrivateAddr_AllowedRanges(t *testing.T) {
 // TestIsPrivateAddr_IPv4MappedIPv6 verifies that an IPv4-mapped IPv6 address
 // (::ffff:10.0.0.1) is normalised via Unmap() before the private check.
 func TestIsPrivateAddr_IPv4MappedIPv6(t *testing.T) {
+	t.Parallel()
 	mapped := netip.MustParseAddr("::ffff:10.0.0.1")
 	if !isPrivateAddr(mapped) {
 		t.Errorf("isPrivateAddr(::ffff:10.0.0.1) = false, want true (RFC 1918 after Unmap)")

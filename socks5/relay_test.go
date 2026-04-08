@@ -17,6 +17,7 @@ import (
 // The test uses real TCP connections (not net.Pipe) so that CloseWrite is
 // available on both sides, which is representative of production behaviour.
 func TestRelay_HalfClose(t *testing.T) {
+	t.Parallel()
 	dial := func(t *testing.T) (client, server net.Conn) {
 		t.Helper()
 		ln, err := net.Listen("tcp", "127.0.0.1:0")

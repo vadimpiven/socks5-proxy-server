@@ -250,8 +250,8 @@ func (s *session) handleConnect(ctx context.Context, dest AddrSpec) {
 // sending a failure reply; we cap the drain at gracefulDrainTime (2 s).
 func gracefulClose(conn net.Conn) {
 	if hc, ok := conn.(halfCloser); ok {
-		hc.CloseWrite()
+		_ = hc.CloseWrite()
 	}
-	conn.SetReadDeadline(time.Now().Add(gracefulDrainTime))
-	io.Copy(io.Discard, conn)
+	_ = conn.SetReadDeadline(time.Now().Add(gracefulDrainTime))
+	_, _ = io.Copy(io.Discard, conn)
 }

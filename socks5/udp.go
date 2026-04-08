@@ -66,7 +66,15 @@ func (s *session) handleUDPAssociate(ctx context.Context) {
 	}
 
 	// Bind the relay socket on the same address family as the TCP connection.
-	localTCP := s.conn.LocalAddr().(*net.TCPAddr)
+	// Guard the assertion: callers can pass a custom net.Listener (TLS, cmux,
+	// etc.) whose Accept returns connections whose LocalAddr is not *net.TCPAddr.
+	localTCP, ok := s.conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		s.log.Warn("UDP: control connection is not a TCP socket; cannot determine relay address family")
+		_ = writeReply(s.conn, replyGeneralFailure, AddrSpec{})
+		gracefulClose(s.conn)
+		return
+	}
 	udpNet := "udp4"
 	if localTCP.IP.To4() == nil {
 		udpNet = "udp6"
@@ -143,7 +151,7 @@ func runUDPRelay(
 	)
 
 	for {
-		pc.SetReadDeadline(time.Now().Add(idleTimeout))
+		_ = pc.SetReadDeadline(time.Now().Add(idleTimeout))
 
 		n, from, err := pc.ReadFrom(buf)
 		if err != nil {

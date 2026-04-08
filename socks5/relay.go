@@ -24,7 +24,7 @@ type halfCloser interface {
 // peer while still allowing reads in the opposite direction.
 func closeWrite(conn net.Conn) {
 	if hc, ok := conn.(halfCloser); ok {
-		hc.CloseWrite()
+		_ = hc.CloseWrite()
 	}
 }
 
@@ -38,7 +38,7 @@ type idleReader struct {
 }
 
 func (r *idleReader) Read(p []byte) (int, error) {
-	r.conn.SetReadDeadline(time.Now().Add(r.timeout))
+	_ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
 	return r.conn.Read(p)
 }
 

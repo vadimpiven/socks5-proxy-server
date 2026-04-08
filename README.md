@@ -11,7 +11,6 @@ A lightweight, embeddable SOCKS5 proxy server written in Go, implementing
 | Auth methods        | No-auth (0x00), username/password (0x02)                 |
 | Address families    | IPv4, IPv6, domain names                                 |
 | Trusted-IP bypass   | Skip auth for known source IPs                           |
-| Auth-once promotion | Whitelist a client IP after its first successful auth    |
 | Concurrency limit   | Configurable max simultaneous connections (default 1024) |
 | Graceful shutdown   | Drains active sessions before exiting                    |
 
@@ -39,7 +38,7 @@ socks5-srv [flags]
   -pass   string   password for authentication (must pair with -user)
   -bind   string   local IP to bind outgoing connections to
   -allow  string   comma-separated IPs that bypass authentication
-  -auth-once       whitelist a client IP after first successful auth
+  -private         allow connections to private/loopback destinations
   -quiet           suppress informational log output
 ```
 
@@ -106,15 +105,16 @@ socks5.Config{
 }
 ```
 
-### Custom access control
+### Private-destination policy
+
+By default, CONNECT to private, loopback, and link-local addresses is blocked
+(SSRF protection). Pass `AllowPrivateDestinations: true` for deployments that
+intentionally proxy to internal infrastructure:
 
 ```go
-// Allow only CONNECT; reject UDP ASSOCIATE.
 socks5.Config{
-    Rules: socks5.PermitCommand{EnableConnect: true},
+    AllowPrivateDestinations: true,
 }
-
-// Implement socks5.RuleSet for user- or destination-based control.
 ```
 
 ## Testing
