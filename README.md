@@ -13,6 +13,7 @@ A lightweight, embeddable SOCKS5 proxy server written in Go, implementing
 | Per-user policy     | Private-destination access controlled per user           |
 | Concurrency limit   | Configurable max simultaneous connections (default 1024) |
 | Graceful shutdown   | Drains active sessions before exiting                    |
+| Hot reload          | SIGHUP reloads config without dropping active sessions   |
 
 > **Not implemented:** BIND (0x02) — rejected with reply 0x07.  
 > **Not implemented:** GSSAPI (method 0x01) — absent from virtually all deployed SOCKS5 stacks.  
@@ -31,38 +32,66 @@ go build -o socks5-srv .
 ## Usage
 
 ```text
-socks5-srv -config <file> [flags]
+socks5-srv [flags]
 
-  -config   string   NDJSON file with user entries (required)
-  -addr     string   listen address (default ":1080")
-  -bind     string   local IP to bind outgoing connections to
-  -quiet             suppress informational log output
+  -config   string   path to TOML configuration file (default "socks5-srv.toml")
+  -verbose           enable verbose log output
+  -version           print version and exit
 ```
 
-### Config file format (NDJSON — one JSON object per line)
+On first run, if the config file does not exist, the server creates it with
+documented defaults and continues running. The default config enables password
+authentication with an empty user list, which denies all connections until the
+operator adds at least one user.
 
-```jsonl
-{"id": "alice", "login": "alice", "password": "s3cr3t", "private": true}
-{"id": "bob",   "login": "bob",   "password": "hunter2", "private": false}
+Send SIGHUP to reload the configuration without dropping active sessions:
+
+```sh
+kill -HUP $(pidof socks5-srv)
 ```
 
-| Field      | Description                                              |
-| ---------- | -------------------------------------------------------- |
-| `id`       | Human-readable name (for the operator's convenience)     |
-| `login`    | SOCKS5 authentication username                           |
-| `password` | SOCKS5 authentication password                           |
-| `private`  | Allow connections to private/loopback destinations       |
+### Config file format (TOML)
+
+```toml
+# Listen address (host:port).
+addr = ":1080"
+
+# Network interface for outbound connections (e.g. "eth0", "en0").
+# bind = "eth0"
+
+# Presence of [users] enables username/password authentication.
+# An empty section denies all connections. Remove it for no-auth mode.
+# The key is a human-readable ID; "login" defaults to the key if omitted.
+[users]
+alice = { login = "alice", password = "s3cr3t", private = true }
+bob   = { login = "bob",   password = "hunter2" }
+```
+
+| Field      | Scope    | Description                                           |
+| ---------- | -------- | ----------------------------------------------------- |
+| `addr`     | global   | Listen address (default `":1080"`)                    |
+| `bind`     | global   | Network interface for outbound connections            |
+| `[users]`  | section  | Presence enables password auth; absence means no-auth |
+| `login`    | per-user | SOCKS5 username (defaults to the key if omitted)      |
+| `password` | per-user | SOCKS5 password (required)                            |
+| `private`  | per-user | Allow connections to private/loopback destinations    |
 
 ### Basic usage
 
 ```sh
-./socks5-srv -config users.jsonl
+./socks5-srv
 ```
 
-### Restrict outbound to a specific network interface
+### Verbose logging
 
 ```sh
-./socks5-srv -config users.jsonl -bind 203.0.113.1
+./socks5-srv -verbose
+```
+
+### Custom config path
+
+```sh
+./socks5-srv -config /etc/socks5-srv.toml
 ```
 
 ## Embedding

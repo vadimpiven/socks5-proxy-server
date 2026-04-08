@@ -4,6 +4,7 @@ package socks5
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -58,5 +59,32 @@ func FuzzParseUDPHeader(f *testing.F) {
 		}
 		// payload must be a valid (possibly empty) sub-slice of b.
 		_ = payload
+	})
+}
+
+// FuzzDoUserPassAuth checks that the RFC 1929 sub-negotiation parser never
+// panics on arbitrary input. Covers VER/ULEN/PLEN boundary conditions.
+//
+// Run with: go test -fuzz=FuzzDoUserPassAuth -fuzztime=60s ./socks5/
+func FuzzDoUserPassAuth(f *testing.F) {
+	// Seed corpus: valid auth, bad version, zero ULEN, zero PLEN, truncated.
+	f.Add([]byte{authSubVersion, 0x05, 'a', 'l', 'i', 'c', 'e', 0x06, 's', '3', 'c', 'r', '3', 't'}) // alice:s3cr3t
+	f.Add([]byte{0x02, 0x01, 'u', 0x01, 'p'})                                                          // wrong sub-version
+	f.Add([]byte{authSubVersion, 0x00, 0x01, 'p'})                                                      // ULEN=0
+	f.Add([]byte{authSubVersion, 0x01, 'u', 0x00})                                                      // PLEN=0
+	f.Add([]byte{authSubVersion})                                                                        // truncated after VER
+	f.Add([]byte{})                                                                                      // empty
+
+	store := MapCredentials{"user": "pass"}
+
+	f.Fuzz(func(t *testing.T, b []byte) {
+		// Reads come from fuzz input; writes are discarded.
+		rw := struct {
+			io.Reader
+			io.Writer
+		}{bytes.NewReader(b), io.Discard}
+
+		// Must not panic. We don't care about the result.
+		doUserPassAuth(rw, store)
 	})
 }

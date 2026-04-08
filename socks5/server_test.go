@@ -1122,3 +1122,117 @@ func TestPerUserPrivatePolicy_NoAuth(t *testing.T) {
 
 	connectAndExpectBlocked(t, proxyAddr, addrTypeIPv4, []byte{127, 0, 0, 1}, 80)
 }
+
+// TestHandshakeTimeout verifies that the server disconnects a client that
+// stalls during the handshake (slow-loris protection, RFC 1928 §3-4).
+func TestHandshakeTimeout(t *testing.T) {
+	t.Parallel()
+
+	proxyAddr, cancel := startProxy(t, Config{
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	defer cancel()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Send only the version byte and then stall — never complete the greeting.
+	conn.Write([]byte{version5})
+
+	// The server should close the connection after the handshake timeout.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 2)
+	_, err = conn.Read(buf)
+	if err == nil {
+		t.Fatal("expected connection to be closed by server after handshake timeout")
+	}
+}
+
+// TestFullSession_AuthFailure_MultiUser verifies that wrong credentials are
+// rejected through the full wire protocol when using UserPassAuthMulti.
+func TestFullSession_AuthFailure_MultiUser(t *testing.T) {
+	t.Parallel()
+
+	proxyAddr, cancel := startProxy(t, Config{
+		Authenticators: []Authenticator{
+			UserPassAuthMulti(map[string]string{
+				"alice": "s3cr3t",
+				"bob":   "hunter2",
+			}),
+		},
+	})
+	defer cancel()
+
+	tryAuth := func(t *testing.T, user, pass string) {
+		t.Helper()
+		conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+
+		conn.Write([]byte{version5, 0x01, methodUserPass})
+		resp := make([]byte, 2)
+		io.ReadFull(conn, resp)
+
+		authReq := []byte{authSubVersion, byte(len(user))}
+		authReq = append(authReq, user...)
+		authReq = append(authReq, byte(len(pass)))
+		authReq = append(authReq, pass...)
+		conn.Write(authReq)
+
+		authResp := make([]byte, 2)
+		io.ReadFull(conn, authResp)
+		if authResp[1] == authSuccess {
+			t.Fatalf("expected auth failure for %s/%s, got success", user, pass)
+		}
+
+		// Server must close connection after failure.
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := conn.Read(make([]byte, 1)); err == nil {
+			t.Fatal("expected connection to be closed after auth failure")
+		}
+	}
+
+	t.Run("wrong_password", func(t *testing.T) { tryAuth(t, "alice", "wrong") })
+	t.Run("unknown_user", func(t *testing.T) { tryAuth(t, "nobody", "nope") })
+}
+
+// TestGreeting_MaxNMethods verifies that a greeting offering the maximum
+// 255 methods is accepted and the correct method is selected.
+func TestGreeting_MaxNMethods(t *testing.T) {
+	t.Parallel()
+
+	proxyAddr, cancel := startProxy(t, Config{})
+	defer cancel()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Build a greeting with 255 methods. NoAuth (0x00) is placed last.
+	greeting := make([]byte, 2+255)
+	greeting[0] = version5
+	greeting[1] = 255
+	for i := range 255 {
+		greeting[2+i] = byte(i + 1) // methods 0x01..0xFF
+	}
+	greeting[2+254] = methodNoAuth // put NoAuth at the end
+	conn.Write(greeting)
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != version5 {
+		t.Fatalf("VER = %#x, want 0x05", resp[0])
+	}
+	if resp[1] != methodNoAuth {
+		t.Fatalf("METHOD = %#x, want 0x00 (NoAuth)", resp[1])
+	}
+}

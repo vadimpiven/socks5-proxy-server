@@ -2,4 +2,7 @@ module github.com/vadimpiven/socks5-srv
 
 go 1.26
 
-require golang.org/x/net v0.52.0
+require (
+	github.com/pelletier/go-toml/v2 v2.2.4
+	golang.org/x/net v0.52.0
+)

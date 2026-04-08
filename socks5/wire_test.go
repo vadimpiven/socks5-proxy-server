@@ -7,6 +7,9 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -271,5 +274,94 @@ func TestReplyFromError_Generic(t *testing.T) {
 	err := errors.New("some unknown network error")
 	if got := replyFromError(err); got != replyGeneralFailure {
 		t.Fatalf("replyFromError = %#x, want %#x (general failure)", got, replyGeneralFailure)
+	}
+}
+
+// TestReplyFromError_NetUnreachable verifies that ENETUNREACH maps to reply
+// 0x03 (network unreachable).
+func TestReplyFromError_NetUnreachable(t *testing.T) {
+	t.Parallel()
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ENETUNREACH},
+	}
+	if got := replyFromError(err); got != replyNetUnreachable {
+		t.Fatalf("replyFromError = %#x, want %#x (net unreachable)", got, replyNetUnreachable)
+	}
+}
+
+// TestReplyFromError_HostUnreachable verifies that EHOSTUNREACH maps to reply
+// 0x04 (host unreachable).
+func TestReplyFromError_HostUnreachable(t *testing.T) {
+	t.Parallel()
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.EHOSTUNREACH},
+	}
+	if got := replyFromError(err); got != replyHostUnreachable {
+		t.Fatalf("replyFromError = %#x, want %#x (host unreachable)", got, replyHostUnreachable)
+	}
+}
+
+// TestReplyFromError_Timeout verifies that a timeout error maps to reply
+// 0x04 (host unreachable).
+func TestReplyFromError_Timeout(t *testing.T) {
+	t.Parallel()
+	err := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: &net.DNSError{IsTimeout: true},
+	}
+	if got := replyFromError(err); got != replyHostUnreachable {
+		t.Fatalf("replyFromError = %#x, want %#x (host unreachable for timeout)", got, replyHostUnreachable)
+	}
+}
+
+// TestReadAddr_MaxLengthDomain verifies that a 255-byte domain name (the
+// maximum allowed by the single-byte DLEN field) is parsed correctly.
+func TestReadAddr_MaxLengthDomain(t *testing.T) {
+	t.Parallel()
+	domain := strings.Repeat("a", 255)
+	buf := make([]byte, 0, 1+1+255+2)
+	buf = append(buf, addrTypeDomain, 255)
+	buf = append(buf, domain...)
+	buf = append(buf, 0x00, 0x50) // port 80
+
+	addr, err := readAddr(bytes.NewReader(buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr.Domain != domain {
+		t.Fatalf("domain length = %d, want 255", len(addr.Domain))
+	}
+	if addr.Port != 80 {
+		t.Fatalf("port = %d, want 80", addr.Port)
+	}
+}
+
+// TestParseAddrFromBytes_MaxLengthDomain verifies parseAddrFromBytes with a
+// 255-byte domain.
+func TestParseAddrFromBytes_MaxLengthDomain(t *testing.T) {
+	t.Parallel()
+	domain := strings.Repeat("b", 255)
+	buf := make([]byte, 0, 2+255+2)
+	buf = append(buf, addrTypeDomain, 255)
+	buf = append(buf, domain...)
+	buf = append(buf, 0x01, 0xBB) // port 443
+
+	addr, n, err := parseAddrFromBytes(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr.Domain != domain {
+		t.Fatalf("domain length = %d, want 255", len(addr.Domain))
+	}
+	if addr.Port != 443 {
+		t.Fatalf("port = %d, want 443", addr.Port)
+	}
+	if n != 2+255+2 {
+		t.Fatalf("consumed = %d, want %d", n, 2+255+2)
 	}
 }

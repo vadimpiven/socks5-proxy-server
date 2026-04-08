@@ -12,3 +12,7 @@ coverage.*
 
 # macOS metadata
 .DS_Store
+
+# Local configuration files
+.env
+.claude/settings.local.json
