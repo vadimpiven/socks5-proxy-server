@@ -10,17 +10,13 @@ import (
 )
 
 // TestRelay_HalfClose verifies that when one side of a relayed connection
-// sends a TCP FIN (half-close), the relay propagates it to the other side via
-// CloseWrite rather than tearing down the entire connection. This allows the
-// remote to finish sending before both sides close completely.
+// sends a TCP FIN (half-close), relay propagates it via CloseWrite rather than
+// tearing down the whole connection. This allows the remote to finish sending
+// before both sides close completely.
 //
-// This behaviour is tested at the relay() function level because the
-// integration path requires a type assertion to halfCloser on the connection
-// returned by proxy.SOCKS5 — an implementation detail of an external package.
-// The relay function itself is always exercised on real TCP connections, so
-// this test is representative of production behaviour.
+// The test uses real TCP connections (not net.Pipe) so that CloseWrite is
+// available on both sides, which is representative of production behaviour.
 func TestRelay_HalfClose(t *testing.T) {
-	// Two real TCP listener pairs so CloseWrite is available on both sides.
 	dial := func(t *testing.T) (client, server net.Conn) {
 		t.Helper()
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -45,11 +41,11 @@ func TestRelay_HalfClose(t *testing.T) {
 	errc := make(chan error, 1)
 	go func() { errc <- relay(proxySide, remoteProxySide, 5*time.Second) }()
 
-	// Client sends data then half-closes (FIN) its write side.
+	// Client sends data then half-closes its write side.
 	clientSide.Write([]byte("ping"))
 	clientSide.(*net.TCPConn).CloseWrite()
 
-	// Remote must receive "ping" followed by EOF on its read side.
+	// Remote must receive "ping" followed by EOF.
 	got, err := io.ReadAll(remoteSide)
 	if err != nil {
 		t.Fatalf("remote ReadAll: %v", err)
@@ -58,7 +54,7 @@ func TestRelay_HalfClose(t *testing.T) {
 		t.Fatalf("remote got %q, want %q", got, "ping")
 	}
 
-	// Remote replies and closes its write side.
+	// Remote replies and half-closes.
 	remoteSide.Write([]byte("pong"))
 	remoteSide.(*net.TCPConn).CloseWrite()
 

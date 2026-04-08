@@ -2,7 +2,9 @@
 
 // session.go drives one client connection through the full SOCKS5 pipeline:
 //
-//	negotiate → authenticate → read request → rule check → connect/relay
+//	negotiate auth → read request → rule check → dispatch (CONNECT / UDP ASSOCIATE)
+//
+// This file is internal to the package.
 package socks5
 
 import (
@@ -19,41 +21,97 @@ import (
 
 // session holds the state for one accepted client connection.
 type session struct {
-	conn   net.Conn
-	srv    *Server
-	remote string         // "host:port" string for log fields
-	ap     netip.AddrPort // client's TCP address; .Addr() is already Unmap'd
+	conn net.Conn
+	srv  *Server
+	log  *slog.Logger   // pre-populated with "client" attribute; created once in newSession
+	ap   netip.AddrPort // client's TCP address; .Addr() is already Unmap'd
 }
 
-// newSession constructs a session and extracts the client's address once.
-// net.TCPAddr.AddrPort() (Go 1.18+) gives netip.AddrPort without allocating
-// a net.IP slice.
+// newSession constructs a session, extracting the client address once and
+// building the per-session logger upfront so it is not recreated on every
+// log call.
 func newSession(conn net.Conn, srv *Server) *session {
-	remote := conn.RemoteAddr().String()
+	remoteAddr := conn.RemoteAddr()
+	remote := remoteAddr.String()
+
 	var ap netip.AddrPort
-	if tcp, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+	if tcp, ok := remoteAddr.(*net.TCPAddr); ok {
 		raw := tcp.AddrPort()
-		// Normalise IPv4-mapped IPv6 to plain IPv4.
 		ap = netip.AddrPortFrom(raw.Addr().Unmap(), raw.Port())
 	}
-	return &session{conn: conn, srv: srv, remote: remote, ap: ap}
+
+	logger := srv.cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	return &session{
+		conn: conn,
+		srv:  srv,
+		log:  logger.With("client", remote),
+		ap:   ap,
+	}
 }
 
-// log returns a logger pre-populated with the client's address.
-// Falls back to slog.Default() for Server structs constructed directly in tests.
-func (s *session) log() *slog.Logger {
-	l := s.srv.cfg.Logger
-	if l == nil {
-		l = slog.Default()
+// handle drives the full SOCKS5 session pipeline to completion.
+func (s *session) handle() {
+	defer s.conn.Close()
+
+	// A single deadline covers the entire handshake (greeting + auth +
+	// request) to prevent slow-loris resource exhaustion.
+	s.conn.SetDeadline(time.Now().Add(s.srv.timeouts.handshake))
+
+	authInfo, err := s.negotiateAuth()
+	if err != nil {
+		s.log.Info("auth failed", "err", err)
+		gracefulClose(s.conn)
+		return
 	}
-	return l.With("client", s.remote)
+
+	cmd, dest, err := s.readRequest()
+	if err != nil {
+		s.log.Info("bad request", "err", err)
+		gracefulClose(s.conn)
+		return
+	}
+
+	// Present the request to the rule set before doing anything observable
+	// externally (e.g. a DNS lookup or TCP connection).
+	req := Request{
+		Command:    cmd,
+		ClientAddr: s.ap,
+		Dest:       dest,
+		Auth:       authInfo,
+	}
+	if !s.srv.rules.Allow(context.Background(), req) {
+		_ = writeReply(s.conn, replyNotAllowed, AddrSpec{})
+		s.log.Info("request denied by rule set",
+			"cmd", fmt.Sprintf("%#x", byte(cmd)), "target", dest)
+		gracefulClose(s.conn)
+		return
+	}
+
+	// Clear the handshake deadline before entering the data phase.
+	s.conn.SetDeadline(time.Time{})
+
+	switch cmd {
+	case CommandConnect:
+		s.handleConnect(dest)
+	case CommandUDPAssociate:
+		s.handleUDPAssociate()
+	default:
+		_ = writeReply(s.conn, replyCmdNotSupported, AddrSpec{})
+		s.log.Info("command not supported", "cmd", fmt.Sprintf("%#x", byte(cmd)))
+		gracefulClose(s.conn)
+	}
 }
 
 // negotiateAuth performs RFC 1928 §3 method negotiation followed by the
 // sub-negotiation of the selected method.
 //
-// Trusted-IP bypass: a client whose source IP is in the runtime trusted set
-// is offered NoAuth even when all configured authenticators require credentials.
+// Trusted-IP bypass: a client whose source IP is in the trusted set is offered
+// NoAuth even when all configured authenticators require credentials, without
+// allocating a temporary authenticator slice.
 //
 // Auth-once promotion: after the first successful sub-negotiation for a
 // non-NoAuth method, the client's IP is added to the trusted set when
@@ -80,19 +138,18 @@ func (s *session) negotiateAuth() (AuthInfo, error) {
 		return nil, fmt.Errorf("read methods: %w", err)
 	}
 
-	// Build the effective authenticator list. Trusted client IPs bypass any
-	// credential-requiring authenticators by prepending a NoAuth shortcut.
-	authenticators := s.srv.cfg.Authenticators
-	if s.srv.isTrusted(s.ap.Addr()) {
-		authenticators = append([]Authenticator{NoAuthAuthenticator{}}, authenticators...)
-	}
-
-	// Select the first authenticator whose code the client also offered.
+	// Trusted clients bypass credential-requiring authenticators: offer
+	// NoAuth if the client supports it, without allocating a new slice.
 	var selected Authenticator
-	for _, a := range authenticators {
-		if slices.Contains(methods, a.Code()) {
-			selected = a
-			break
+	if s.srv.isTrusted(s.ap.Addr()) && slices.Contains(methods, methodNoAuth) {
+		selected = NoAuthAuthenticator{}
+	}
+	if selected == nil {
+		for _, a := range s.srv.cfg.Authenticators {
+			if slices.Contains(methods, a.Code()) {
+				selected = a
+				break
+			}
 		}
 	}
 
@@ -101,7 +158,6 @@ func (s *session) negotiateAuth() (AuthInfo, error) {
 		return nil, errors.New("no acceptable authentication method")
 	}
 
-	// Send the method-selection response, then run the sub-negotiation.
 	if _, err := s.conn.Write([]byte{version5, selected.Code()}); err != nil {
 		return nil, fmt.Errorf("write method selection: %w", err)
 	}
@@ -114,7 +170,7 @@ func (s *session) negotiateAuth() (AuthInfo, error) {
 	// Auth-once: promote this IP for future connections.
 	if s.srv.cfg.AuthOnce && selected.Code() != methodNoAuth {
 		s.srv.addTrusted(s.ap.Addr())
-		s.log().Info("IP promoted to trusted list (auth-once)")
+		s.log.Info("IP promoted to trusted list (auth-once)")
 	}
 
 	return info, nil
@@ -158,7 +214,7 @@ func (s *session) handleConnect(dest AddrSpec) {
 	remote, err := s.srv.dial(dialCtx, "tcp", dest.String())
 	if err != nil {
 		_ = writeReply(s.conn, replyFromError(err), AddrSpec{})
-		s.log().Info("connect failed", "target", dest, "err", err)
+		s.log.Info("connect failed", "target", dest, "err", err)
 		gracefulClose(s.conn)
 		return
 	}
@@ -168,16 +224,16 @@ func (s *session) handleConnect(dest AddrSpec) {
 	ap := remote.LocalAddr().(*net.TCPAddr).AddrPort()
 	bound := AddrSpec{IP: ap.Addr().Unmap(), Port: ap.Port()}
 	if err := writeReply(s.conn, replySuccess, bound); err != nil {
-		s.log().Warn("write success reply", "err", err)
+		s.log.Warn("write success reply", "err", err)
 		return
 	}
 
-	s.log().Info("relay started", "target", dest)
+	s.log.Info("relay started", "target", dest)
 	if err := relay(s.conn, remote, s.srv.timeouts.tcpIdle); err != nil {
-		s.log().Info("relay ended", "target", dest, "err", err)
+		s.log.Info("relay ended", "target", dest, "err", err)
 		return
 	}
-	s.log().Info("relay ended", "target", dest)
+	s.log.Info("relay ended", "target", dest)
 }
 
 // gracefulClose signals EOF to the peer (TCP half-close) then drains pending
@@ -191,57 +247,4 @@ func gracefulClose(conn net.Conn) {
 	}
 	conn.SetReadDeadline(time.Now().Add(gracefulDrainTime))
 	io.Copy(io.Discard, conn)
-}
-
-// handle drives the full SOCKS5 session pipeline to completion.
-func (s *session) handle() {
-	defer s.conn.Close()
-
-	// A single deadline covers the entire handshake (greeting + auth +
-	// request) to prevent slow-loris resource exhaustion.
-	s.conn.SetDeadline(time.Now().Add(s.srv.timeouts.handshake))
-
-	authInfo, err := s.negotiateAuth()
-	if err != nil {
-		s.log().Info("auth failed", "err", err)
-		gracefulClose(s.conn)
-		return
-	}
-
-	cmd, dest, err := s.readRequest()
-	if err != nil {
-		s.log().Info("bad request", "err", err)
-		gracefulClose(s.conn)
-		return
-	}
-
-	// Present the request to the rule set before doing anything observable
-	// externally (e.g. a DNS lookup or TCP connection).
-	req := Request{
-		Command:    cmd,
-		ClientAddr: s.ap,
-		Dest:       dest,
-		Auth:       authInfo,
-	}
-	if !s.srv.rules.Allow(context.Background(), req) {
-		_ = writeReply(s.conn, replyNotAllowed, AddrSpec{})
-		s.log().Info("request denied by rule set",
-			"cmd", fmt.Sprintf("%#x", byte(cmd)), "target", dest)
-		gracefulClose(s.conn)
-		return
-	}
-
-	// Clear the handshake deadline before entering the data phase.
-	s.conn.SetDeadline(time.Time{})
-
-	switch cmd {
-	case CommandConnect:
-		s.handleConnect(dest)
-	case CommandUDPAssociate:
-		s.handleUDPAssociate(dest)
-	default:
-		_ = writeReply(s.conn, replyCmdNotSupported, AddrSpec{})
-		s.log().Info("command not supported", "cmd", fmt.Sprintf("%#x", byte(cmd)))
-		gracefulClose(s.conn)
-	}
 }

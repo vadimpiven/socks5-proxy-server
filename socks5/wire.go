@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// Package socks5 implements a SOCKS5 proxy server (RFC 1928 / RFC 1929).
-//
-// Supported commands:
-//   - CONNECT (0x01): tunnels a TCP stream to any IPv4, IPv6, or domain-name
-//     destination.
-//   - UDP ASSOCIATE (0x03): relays UDP datagrams with SOCKS5 encapsulation;
-//     fragmentation is not supported (RFC 1928 §7 permits this).
-//
-// BIND (0x02) and GSSAPI are not implemented; both are rejected with the
-// appropriate reply codes.
-//
-// All behaviour is configurable through interfaces: auth methods via
-// [Authenticator], credential validation via [CredentialStore], access
-// control via [RuleSet], name resolution via [Resolver], and outbound
-// dialing via [DialFunc].
+// wire.go contains SOCKS5 wire-protocol constants and the unexported encoding
+// and decoding functions used by session.go and udp.go. All symbols here are
+// unexported; normal use of the package does not require reading this file.
 package socks5
 
 import (
@@ -25,39 +13,27 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strconv"
 	"syscall"
 )
 
-// ── Wire-protocol constants ──────────────────────────────────────────────────
-
-// version5 is the only SOCKS protocol version we support (RFC 1928 §3).
+// version5 is the only SOCKS protocol version this server accepts (RFC 1928 §3).
 const version5 byte = 0x05
 
-// Authentication methods (RFC 1928 §3).
+// Authentication method codes (RFC 1928 §3).
 const (
 	methodNoAuth       byte = 0x00
 	methodUserPass     byte = 0x02
 	methodNoAcceptable byte = 0xFF
 )
 
-// Sub-negotiation version for username/password auth (RFC 1929 §2).
+// Username/password sub-negotiation constants (RFC 1929 §2).
 const (
 	authSubVersion byte = 0x01
 	authSuccess    byte = 0x00
 	authFailure    byte = 0x01
 )
 
-// Command is a SOCKS5 request command (RFC 1928 §4).
-type Command byte
-
-const (
-	CommandConnect      Command = 0x01
-	CommandBind         Command = 0x02 // not implemented; rejected with 0x07
-	CommandUDPAssociate Command = 0x03
-)
-
-// Address types (RFC 1928 §5).
+// Address type bytes (RFC 1928 §5).
 const (
 	addrTypeIPv4   byte = 0x01
 	addrTypeDomain byte = 0x03
@@ -72,55 +48,18 @@ const (
 	replyNetUnreachable   byte = 0x03
 	replyHostUnreachable  byte = 0x04
 	replyConnRefused      byte = 0x05
-	replyTTLExpired       byte = 0x06 // ICMP time-exceeded; NOT used for dial timeouts
 	replyCmdNotSupported  byte = 0x07
 	replyAddrNotSupported byte = 0x08
 )
-
-// ── AddrSpec ─────────────────────────────────────────────────────────────────
-
-// AddrSpec is a SOCKS5 network destination: either a literal IP address or a
-// domain name, plus a port. Exactly one of IP and Domain is set.
-//
-// IP destinations always use the plain IPv4 or IPv6 form — IPv4-mapped IPv6
-// (::ffff:a.b.c.d) is normalised to plain IPv4 by the parser.
-type AddrSpec struct {
-	// IP is the destination for literal-IP requests.
-	// Zero (not IsValid) when Domain is set.
-	IP netip.Addr
-	// Domain is the fully-qualified host name for DOMAINNAME requests.
-	// Empty when IP is set.
-	Domain string
-	// Port is the destination TCP or UDP port.
-	Port uint16
-}
-
-// String returns a "host:port" string suitable for net.Dial.
-func (a AddrSpec) String() string {
-	if a.Domain != "" {
-		return net.JoinHostPort(a.Domain, strconv.Itoa(int(a.Port)))
-	}
-	return netip.AddrPortFrom(a.IP, a.Port).String()
-}
-
-// AddrPort returns the netip.AddrPort for IP destinations, or the zero value
-// for domain destinations (where no IP is known yet).
-func (a AddrSpec) AddrPort() netip.AddrPort {
-	return netip.AddrPortFrom(a.IP, a.Port)
-}
-
-// isIP reports whether this is a literal-IP (non-domain) destination.
-func (a AddrSpec) isIP() bool { return a.Domain == "" }
 
 var (
 	errUnsupportedAddrType = errors.New("unsupported address type")
 	errEmptyDomainName     = errors.New("empty domain name")
 )
 
-// ── Wire encoding / decoding ─────────────────────────────────────────────────
-
 // readAddr reads ATYP + address + port from the wire (RFC 1928 §4/§5) and
-// returns the destination as an AddrSpec. IPv4-mapped IPv6 is normalised.
+// returns the destination as an AddrSpec. IPv4-mapped IPv6 is normalised to
+// plain IPv4.
 func readAddr(r io.Reader) (AddrSpec, error) {
 	var atype [1]byte
 	if _, err := io.ReadFull(r, atype[:]); err != nil {
@@ -181,9 +120,54 @@ func readPort(r io.Reader) (uint16, error) {
 	return binary.BigEndian.Uint16(b[:]), nil
 }
 
+// parseAddrFromBytes parses ATYP + address + port from b and returns the
+// AddrSpec and the number of bytes consumed. Used by the UDP relay path to
+// avoid allocating a bytes.Reader for each incoming datagram.
+func parseAddrFromBytes(b []byte) (AddrSpec, int, error) {
+	if len(b) == 0 {
+		return AddrSpec{}, 0, io.ErrUnexpectedEOF
+	}
+	switch b[0] {
+	case addrTypeIPv4:
+		if len(b) < 1+4+2 {
+			return AddrSpec{}, 0, io.ErrUnexpectedEOF
+		}
+		ip := netip.AddrFrom4([4]byte(b[1:5]))
+		port := binary.BigEndian.Uint16(b[5:7])
+		return AddrSpec{IP: ip, Port: port}, 7, nil
+
+	case addrTypeIPv6:
+		if len(b) < 1+16+2 {
+			return AddrSpec{}, 0, io.ErrUnexpectedEOF
+		}
+		ip := netip.AddrFrom16([16]byte(b[1:17])).Unmap()
+		port := binary.BigEndian.Uint16(b[17:19])
+		return AddrSpec{IP: ip, Port: port}, 19, nil
+
+	case addrTypeDomain:
+		if len(b) < 2 {
+			return AddrSpec{}, 0, io.ErrUnexpectedEOF
+		}
+		dlen := int(b[1])
+		if dlen == 0 {
+			return AddrSpec{}, 0, errEmptyDomainName
+		}
+		end := 2 + dlen + 2
+		if len(b) < end {
+			return AddrSpec{}, 0, io.ErrUnexpectedEOF
+		}
+		domain := string(b[2 : 2+dlen])
+		port := binary.BigEndian.Uint16(b[2+dlen : end])
+		return AddrSpec{Domain: domain, Port: port}, end, nil
+
+	default:
+		return AddrSpec{}, 0, fmt.Errorf("%w: %#x", errUnsupportedAddrType, b[0])
+	}
+}
+
 // appendAddr appends the ATYP + address wire encoding of spec to buf.
-// A zero AddrSpec (both IP and Domain unset) encodes as IPv4 0.0.0.0,
-// which is the convention for error replies (RFC 1928 §6).
+// A zero AddrSpec (IP and Domain both unset) encodes as IPv4 0.0.0.0, which
+// is the conventional encoding for error replies (RFC 1928 §6).
 func appendAddr(buf []byte, spec AddrSpec) []byte {
 	switch {
 	case spec.Domain != "":
@@ -198,7 +182,6 @@ func appendAddr(buf []byte, spec AddrSpec) []byte {
 		buf = append(buf, addrTypeIPv6)
 		buf = append(buf, a[:]...)
 	default:
-		// Zero or invalid IP: use IPv4 0.0.0.0 as per convention.
 		buf = append(buf, addrTypeIPv4, 0, 0, 0, 0)
 	}
 	return buf
@@ -215,16 +198,31 @@ func writeReply(w io.Writer, code byte, bound AddrSpec) error {
 	return err
 }
 
+// appendUDPResponse writes a SOCKS5 UDP response header (RFC 1928 §7) followed
+// by payload into dst and returns the number of bytes written. dst must have
+// capacity of at least 22 + len(payload). Used by the relay loop to avoid a
+// per-packet heap allocation.
+//
+// Header layout: RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT(2) | DATA
+func appendUDPResponse(dst []byte, from netip.AddrPort, payload []byte) int {
+	dst[0], dst[1], dst[2] = 0, 0, 0 // RSV RSV FRAG
+	src := AddrSpec{IP: from.Addr().Unmap()}
+	hdr := appendAddr(dst[:3], src)
+	port := from.Port()
+	hdr = append(hdr, byte(port>>8), byte(port))
+	n := len(hdr)
+	copy(dst[n:], payload)
+	return n + len(payload)
+}
+
 // replyFromError maps a Go network error to the closest SOCKS5 reply code
 // (RFC 1928 §6).
 //
-// Mapping rationale:
-//   - replyTTLExpired (0x06) is reserved for ICMP "time exceeded" (IP TTL
-//     reached zero in transit). It must NOT be used for a dial deadline.
-//   - A dial deadline or TCP retransmit timeout (ETIMEDOUT) means the remote
-//     host did not respond → replyHostUnreachable (0x04).
-//   - EHOSTUNREACH covers both ICMP host-unreachable and ICMP TTL-exceeded,
-//     since the kernel surfaces both as the same errno.
+// Reply 0x06 (TTL exceeded) is reserved for ICMP "time exceeded" and must not
+// be used for dial deadlines. A dial deadline or ETIMEDOUT means the host did
+// not respond, which maps to replyHostUnreachable (0x04). EHOSTUNREACH covers
+// both ICMP host-unreachable and TTL-exceeded because the kernel exposes both
+// as the same errno.
 func replyFromError(err error) byte {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Timeout() {

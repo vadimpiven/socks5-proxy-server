@@ -8,14 +8,14 @@ import (
 	"testing"
 )
 
-// ruleSetFunc adapts a function to the RuleSet interface.
-// Used by server_test.go to capture Request values inside integration tests.
+// ruleSetFunc adapts a function to the [RuleSet] interface.
+// Used by server_test.go to capture [Request] values inside integration tests.
 type ruleSetFunc func(context.Context, Request) bool
 
 func (f ruleSetFunc) Allow(ctx context.Context, req Request) bool { return f(ctx, req) }
 
-// TestPermitCommand verifies that PermitCommand allows and denies the correct
-// command types according to its configuration.
+// TestPermitCommand verifies that [PermitCommand] allows and denies the
+// correct command types according to its configuration.
 func TestPermitCommand(t *testing.T) {
 	r := PermitCommand{EnableConnect: true, EnableUDPAssociate: false}
 	ctx := context.Background()

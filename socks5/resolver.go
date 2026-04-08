@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// resolver.go defines the Resolver interface for domain-name resolution and
-// the DialFunc type for outbound TCP connections.
+// resolver.go defines [Resolver] for domain-name resolution and [DialFunc]
+// for outbound TCP connections.
 //
-// Resolver is used by the UDP relay to resolve per-datagram domain destinations.
-// For TCP CONNECT, name resolution is handled by the [DialFunc] itself (so a
-// custom dialer such as a chained proxy can do its own DNS).
+// [DefaultResolver] is used when [Config.Resolver] is nil; it resolves names
+// via the system DNS. Implement [Resolver] to route resolution through a
+// custom server, add caching, or rewrite names.
 //
-// DialFunc is used by the server for every outbound CONNECT connection.
-// The default is built from [Config.BindAddr]; callers may replace it to
-// route through another proxy, add metrics, enforce TLS, etc.
+// [DialFunc] is the type of [Config.Dial]. The method value of
+// [net.Dialer.DialContext] satisfies this type directly, making it easy to
+// add bind addresses, metrics, TLS, or proxy chaining.
 package socks5
 
 import (
@@ -20,6 +20,8 @@ import (
 )
 
 // Resolver resolves a host name to an IP address.
+// It is used by the UDP relay to resolve per-datagram domain destinations.
+// TCP CONNECT lets [DialFunc] handle DNS internally.
 type Resolver interface {
 	// Resolve looks up host and returns one address.
 	// The context may carry a deadline or cancellation signal.
@@ -28,7 +30,8 @@ type Resolver interface {
 
 // DefaultResolver uses the system DNS resolver via [net.Resolver.LookupNetIP]
 // (Go 1.21+), which returns [netip.Addr] values directly.
-// It returns the first result, preferring IPv4 when both families are available.
+// It returns the first result in the order the resolver provides; the
+// address family depends on the system DNS configuration.
 type DefaultResolver struct{}
 
 func (DefaultResolver) Resolve(ctx context.Context, host string) (netip.Addr, error) {

@@ -15,8 +15,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// discardLogger returns a logger that silences all output, suitable for tests
-// where log noise would obscure failures.
+// discardLogger returns a logger that silences all output.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -45,7 +44,7 @@ func startEchoServer(t *testing.T) net.Listener {
 
 // startProxy starts a SOCKS5 server with the given Config on a random port.
 // If cfg.Logger is nil it is set to a discard logger so tests stay silent.
-func startProxy(t *testing.T, cfg Config) (string, context.CancelFunc) {
+func startProxy(t *testing.T, cfg Config) (addr string, cancel context.CancelFunc) {
 	t.Helper()
 	if cfg.Logger == nil {
 		cfg.Logger = discardLogger()
@@ -63,7 +62,7 @@ func startProxy(t *testing.T, cfg Config) (string, context.CancelFunc) {
 		cancel()
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
+	addr = ln.Addr().String()
 	go srv.Serve(ctx, ln)
 	return addr, cancel
 }
@@ -71,7 +70,6 @@ func startProxy(t *testing.T, cfg Config) (string, context.CancelFunc) {
 // dialThroughProxy connects to target via the SOCKS5 proxy at proxyAddr using
 // golang.org/x/net/proxy — a real, independent SOCKS5 client implementation.
 // Passing a non-nil auth enables username/password authentication.
-// The connection is registered for cleanup with t.Cleanup.
 func dialThroughProxy(t *testing.T, proxyAddr string, auth *proxy.Auth, target string) net.Conn {
 	t.Helper()
 	d, err := proxy.SOCKS5("tcp", proxyAddr, auth, proxy.Direct)
@@ -85,8 +83,6 @@ func dialThroughProxy(t *testing.T, proxyAddr string, auth *proxy.Auth, target s
 	t.Cleanup(func() { conn.Close() })
 	return conn
 }
-
-// ── Core session tests ───────────────────────────────────────────────────────
 
 func TestFullSession_NoAuth_Connect(t *testing.T) {
 	echo := startEchoServer(t)
@@ -111,11 +107,8 @@ func TestFullSession_UserPass_Connect(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
 
-	creds := StaticCredentials{Username: "user", Password: "pass"}
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{
-			UserPassAuthenticator{Credentials: creds},
-		},
+		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
 	})
 	defer cancel()
 
@@ -134,16 +127,13 @@ func TestFullSession_UserPass_Connect(t *testing.T) {
 	}
 }
 
-// TestFullSession_AuthFailure probes the server's RFC 1929 failure path at
-// the wire level: it sends deliberately wrong credentials and checks that the
-// server responds with STATUS=0x01 and then closes the connection.
-// proxy.SOCKS5 is not used here because we need to inject the wrong password.
+// TestFullSession_AuthFailure probes the RFC 1929 failure path at the wire
+// level: wrong credentials must produce STATUS=0x01 followed by connection
+// close. proxy.SOCKS5 is not used here because we need to inject the wrong
+// password.
 func TestFullSession_AuthFailure(t *testing.T) {
-	creds := StaticCredentials{Username: "user", Password: "pass"}
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{
-			UserPassAuthenticator{Credentials: creds},
-		},
+		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
 	})
 	defer cancel()
 
@@ -165,20 +155,22 @@ func TestFullSession_AuthFailure(t *testing.T) {
 
 	authResp := make([]byte, 2)
 	io.ReadFull(conn, authResp)
+	if authResp[0] != authSubVersion {
+		t.Fatalf("auth response VER = %#x, want 0x01 (RFC 1929 §2)", authResp[0])
+	}
 	if authResp[1] != authFailure {
 		t.Fatalf("STATUS = %#x, want %#x (failure)", authResp[1], authFailure)
 	}
 
 	// RFC 1929 §2: server MUST close the connection after a failure response.
 	conn.SetReadDeadline(time.Now().Add(time.Second))
-	buf := make([]byte, 1)
-	if _, err = conn.Read(buf); err == nil {
+	if _, err = conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expected connection to be closed after auth failure")
 	}
 }
 
-// TestFullSession_UnsupportedCommand probes the BIND rejection path at the
-// wire level to verify the exact reply code (0x07).
+// TestFullSession_UnsupportedCommand verifies the exact reply code (0x07) for
+// BIND, which is not implemented.
 func TestFullSession_UnsupportedCommand(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -190,7 +182,7 @@ func TestFullSession_UnsupportedCommand(t *testing.T) {
 	defer conn.Close()
 
 	conn.Write([]byte{version5, 0x01, methodNoAuth})
-	io.ReadFull(conn, make([]byte, 2)) // consume method selection
+	io.ReadFull(conn, make([]byte, 2))
 
 	conn.Write([]byte{version5, byte(CommandBind), 0x00, addrTypeIPv4, 127, 0, 0, 1, 0x00, 0x50})
 
@@ -205,8 +197,8 @@ func TestFullSession_UnsupportedCommand(t *testing.T) {
 	}
 }
 
-// TestFullSession_ConnectionRefused verifies the exact SOCKS5 reply code
-// (0x05) when the target port is not listening.
+// TestFullSession_ConnectionRefused verifies the exact reply code (0x05) when
+// the target port is not listening.
 func TestFullSession_ConnectionRefused(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -251,11 +243,7 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 }
 
-// ── RFC 1928 §3 — Greeting compliance ──────────────────────────────────────
-
 // TestGreeting_WrongVersion verifies RFC 1928 §3: VER must be 0x05.
-// A client speaking a different SOCKS version receives no method-selection
-// response; the server closes the connection.
 func TestGreeting_WrongVersion(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -266,25 +254,22 @@ func TestGreeting_WrongVersion(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// SOCKS4 greeting.
-	conn.Write([]byte{0x04, 0x01, methodNoAuth})
+	conn.Write([]byte{0x04, 0x01, methodNoAuth}) // SOCKS4 greeting
 
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	buf := make([]byte, 4)
 	n, _ := conn.Read(buf)
-	// Server MUST NOT send a valid method-selection response.
 	if n >= 2 && buf[0] == version5 && buf[1] != methodNoAcceptable {
 		t.Fatalf("server returned a valid method selection for wrong VER: %x", buf[:n])
 	}
-	// RFC 1928 §3: server must close the connection after rejecting.
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expected connection to be closed after wrong VER")
 	}
 }
 
-// TestGreeting_ZeroNMethods verifies RFC 1928 §3: NMETHODS is described as
-// containing 1 to 255 method bytes. A value of 0 must be rejected with 0xFF.
+// TestGreeting_ZeroNMethods verifies RFC 1928 §3: NMETHODS=0 must be rejected
+// with method byte 0xFF.
 func TestGreeting_ZeroNMethods(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -306,11 +291,8 @@ func TestGreeting_ZeroNMethods(t *testing.T) {
 	}
 }
 
-// ── RFC 1928 §4 — Request compliance ────────────────────────────────────────
-
-// TestRequest_NonZeroRSV verifies RFC 1928 §4: "Fields marked RESERVED (RSV)
-// must be set to X'00'." A non-zero RSV byte must produce reply 0x01
-// (general failure) and close the connection.
+// TestRequest_NonZeroRSV verifies RFC 1928 §4: a non-zero RSV byte must
+// produce reply 0x01 (general failure) and close the connection.
 func TestRequest_NonZeroRSV(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -324,7 +306,6 @@ func TestRequest_NonZeroRSV(t *testing.T) {
 	conn.Write([]byte{version5, 0x01, methodNoAuth})
 	io.ReadFull(conn, make([]byte, 2))
 
-	// RSV=0x01 instead of 0x00.
 	conn.Write([]byte{version5, byte(CommandConnect), 0x01, addrTypeIPv4, 127, 0, 0, 1, 0x00, 0x50})
 
 	reply := make([]byte, 10)
@@ -332,7 +313,6 @@ func TestRequest_NonZeroRSV(t *testing.T) {
 	if reply[1] != replyGeneralFailure {
 		t.Fatalf("REP = %#x, want 0x01 (general failure) for non-zero RSV", reply[1])
 	}
-	// RFC 1928 §6: MUST terminate the connection shortly after a failure reply.
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expected connection close after failure reply (RFC 1928 §6)")
@@ -354,8 +334,7 @@ func TestRequest_UnknownATYP(t *testing.T) {
 	conn.Write([]byte{version5, 0x01, methodNoAuth})
 	io.ReadFull(conn, make([]byte, 2))
 
-	// ATYP=0x02 is not defined by RFC 1928.
-	conn.Write([]byte{version5, byte(CommandConnect), 0x00, 0x02, 0x00, 0x00})
+	conn.Write([]byte{version5, byte(CommandConnect), 0x00, 0x02, 0x00, 0x00}) // ATYP=0x02 undefined
 
 	reply := make([]byte, 10)
 	io.ReadFull(conn, reply)
@@ -368,18 +347,14 @@ func TestRequest_UnknownATYP(t *testing.T) {
 	}
 }
 
-// ── RFC 1928 §5 — DOMAINNAME addressing ─────────────────────────────────────
-
-// TestConnect_DomainName verifies that the server handles ATYP=0x03 (domain
-// name) by resolving the name server-side and establishing the connection.
-// This exercises the DialFunc DNS path end-to-end.
+// TestConnect_DomainName verifies that ATYP=0x03 (domain name) is resolved
+// server-side and the connection is established (RFC 1928 §5).
 func TestConnect_DomainName(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
 
-	// "localhost" is the canonical loopback name; port comes from the echo server.
 	_, portStr, _ := net.SplitHostPort(echo.Addr().String())
 	conn := dialThroughProxy(t, proxyAddr, nil, "localhost:"+portStr)
 
@@ -394,10 +369,8 @@ func TestConnect_DomainName(t *testing.T) {
 	}
 }
 
-// TestRequest_WrongVersion verifies that a wrong VER byte in the request
+// TestRequest_WrongVersion verifies that a wrong VER byte in the request phase
 // (after successful auth) causes the server to close without sending a reply.
-// RFC 1928 §4 requires VER=0x05; no specific reply code is defined for this
-// violation, so the server closes cleanly.
 func TestRequest_WrongVersion(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -408,25 +381,19 @@ func TestRequest_WrongVersion(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Successful NoAuth greeting.
 	conn.Write([]byte{version5, 0x01, methodNoAuth})
 	io.ReadFull(conn, make([]byte, 2))
 
-	// Request with VER=0x04 (wrong version).
 	conn.Write([]byte{0x04, byte(CommandConnect), 0x00, addrTypeIPv4, 127, 0, 0, 1, 0x00, 0x50})
 
-	// Server sends no reply for wrong VER in the request phase; it just closes.
 	conn.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expected connection to be closed after wrong VER in request")
 	}
 }
 
-// TestConnect_BNDAddrPort verifies RFC 1928 §6: "In the reply to a CONNECT,
-// BND.PORT contains the port number that the server assigned to connect to
-// the target host, while BND.ADDR contains the associated IP address."
-// proxy.SOCKS5 reads and discards BND.ADDR/PORT, so this test inspects the
-// raw reply bytes directly.
+// TestConnect_BNDAddrPort verifies RFC 1928 §6: the success reply must carry
+// the actual bound address and port (not zeros).
 func TestConnect_BNDAddrPort(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
@@ -440,17 +407,14 @@ func TestConnect_BNDAddrPort(t *testing.T) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	// NoAuth greeting.
 	conn.Write([]byte{version5, 0x01, methodNoAuth})
 	io.ReadFull(conn, make([]byte, 2))
 
-	// CONNECT to echo server.
 	echoTCP := echo.Addr().(*net.TCPAddr)
 	req := append([]byte{version5, byte(CommandConnect), 0x00, addrTypeIPv4}, echoTCP.IP.To4()...)
 	req = binary.BigEndian.AppendUint16(req, uint16(echoTCP.Port))
 	conn.Write(req)
 
-	// Read reply header: VER | REP | RSV | ATYP.
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
 		t.Fatal(err)
@@ -459,7 +423,6 @@ func TestConnect_BNDAddrPort(t *testing.T) {
 		t.Fatalf("REP = %#x, want 0x00 (success)", hdr[1])
 	}
 
-	// Read and validate BND.ADDR and BND.PORT.
 	var bndIP net.IP
 	var bndPort uint16
 	switch hdr[3] {
@@ -482,8 +445,6 @@ func TestConnect_BNDAddrPort(t *testing.T) {
 		t.Error("BND.ADDR is all-zeros: RFC 1928 §6 requires the actual bound address")
 	}
 }
-
-// ── RuleSet integration tests ────────────────────────────────────────────────
 
 // TestRuleSet_DenyAll verifies the exact reply code (0x02) when the RuleSet
 // denies a request.
@@ -513,6 +474,8 @@ func TestRuleSet_DenyAll(t *testing.T) {
 	}
 }
 
+// TestRuleSet_AuthInfoAvailable verifies that [Request.Auth] carries the
+// identity from the completed auth phase into the rule set.
 func TestRuleSet_AuthInfoAvailable(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
@@ -523,9 +486,8 @@ func TestRuleSet_AuthInfoAvailable(t *testing.T) {
 		return true
 	})
 
-	creds := StaticCredentials{Username: "user", Password: "pass"}
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuthenticator{Credentials: creds}},
+		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
 		Rules:          rules,
 	})
 	defer cancel()
@@ -545,20 +507,18 @@ func TestRuleSet_AuthInfoAvailable(t *testing.T) {
 	}
 }
 
-// ── TrustedIPs tests ─────────────────────────────────────────────────────────
-
+// TestTrustedIPs_BypassAuth verifies that a client IP listed in
+// [Config.TrustedIPs] may connect without credentials.
 func TestTrustedIPs_BypassAuth(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
 
-	creds := StaticCredentials{Username: "user", Password: "pass"}
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuthenticator{Credentials: creds}},
+		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
 		TrustedIPs:     []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 	})
 	defer cancel()
 
-	// Connect without credentials — 127.0.0.1 is trusted, so NoAuth must succeed.
 	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
 
 	conn.Write([]byte("trusted"))
@@ -569,13 +529,12 @@ func TestTrustedIPs_BypassAuth(t *testing.T) {
 	}
 }
 
-// TestTrustedIPs_UnknownIPRequiresAuth verifies that a non-trusted IP is
-// rejected at method negotiation when it offers only NoAuth.
+// TestTrustedIPs_UnknownIPRequiresAuth verifies that a client not in
+// TrustedIPs is rejected at method negotiation when it offers only NoAuth.
 func TestTrustedIPs_UnknownIPRequiresAuth(t *testing.T) {
-	creds := StaticCredentials{Username: "user", Password: "pass"}
 	// Trust only 10.0.0.1; the test client arrives from 127.0.0.1.
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuthenticator{Credentials: creds}},
+		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
 		TrustedIPs:     []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 	})
 	defer cancel()
@@ -594,20 +553,19 @@ func TestTrustedIPs_UnknownIPRequiresAuth(t *testing.T) {
 	}
 }
 
-// ── AuthOnce tests ───────────────────────────────────────────────────────────
-
+// TestAuthOnce_SecondConnectionSkipsAuth verifies that [Config.AuthOnce]
+// promotes a client IP to the trusted list after its first authenticated
+// connection, allowing subsequent connections without credentials.
 func TestAuthOnce_SecondConnectionSkipsAuth(t *testing.T) {
 	echo := startEchoServer(t)
 	defer echo.Close()
 
-	creds := StaticCredentials{Username: "user", Password: "pass"}
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuthenticator{Credentials: creds}},
+		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
 		AuthOnce:       true,
 	})
 	defer cancel()
 
-	// First connection: authenticate with credentials.
 	conn1 := dialThroughProxy(t, proxyAddr,
 		&proxy.Auth{User: "user", Password: "pass"},
 		echo.Addr().String())
@@ -617,7 +575,7 @@ func TestAuthOnce_SecondConnectionSkipsAuth(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Second connection: IP is now trusted — no credentials required.
+	// IP is now trusted — no credentials required.
 	conn2 := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
 
 	conn2.Write([]byte("second"))

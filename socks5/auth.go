@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// auth.go contains the authentication interfaces and their implementations.
+// auth.go provides authentication helpers, the [Authenticator] and
+// [CredentialStore] interfaces, and their built-in implementations.
 //
-// The two-level abstraction mirrors the SOCKS5 wire protocol:
-//   - [Authenticator] handles one method (the method code + sub-negotiation).
-//   - [CredentialStore] handles credential validation inside [UserPassAuthenticator].
-//
-// Adding a new auth method requires only implementing [Authenticator].
+// Most servers only need [UserPassAuth] (single user) or [UserPassAuthMulti]
+// (multiple users). Use [UserPassAuthenticator] directly only when you need a
+// custom [CredentialStore]. Implement [Authenticator] only for a completely
+// different auth scheme.
 package socks5
 
 import (
@@ -18,47 +18,74 @@ import (
 	"net"
 )
 
-// ── AuthInfo ─────────────────────────────────────────────────────────────────
+// UserPassAuth returns an [Authenticator] for username/password authentication
+// (RFC 1929) with a single fixed credential pair.
+//
+//	cfg.Authenticators = []socks5.Authenticator{socks5.UserPassAuth("alice", "s3cr3t")}
+//
+// For multiple users, use [UserPassAuthMulti]. For a custom credential store,
+// use [UserPassAuthenticator] directly.
+func UserPassAuth(username, password string) Authenticator {
+	return UserPassAuthenticator{
+		Credentials: StaticCredentials{Username: username, Password: password},
+	}
+}
+
+// UserPassAuthMulti returns an [Authenticator] for username/password
+// authentication (RFC 1929) accepting any credential pair in creds
+// (username → password).
+//
+//	cfg.Authenticators = []socks5.Authenticator{
+//	    socks5.UserPassAuthMulti(map[string]string{
+//	        "alice": "s3cr3t",
+//	        "bob":   "hunter2",
+//	    }),
+//	}
+//
+// For a single user, [UserPassAuth] is simpler.
+func UserPassAuthMulti(credentials map[string]string) Authenticator {
+	return UserPassAuthenticator{Credentials: MapCredentials(credentials)}
+}
 
 // AuthInfo carries identity metadata from a completed authentication
 // sub-negotiation into the request pipeline. The concrete type is
-// method-specific; rule sets may type-assert to inspect it.
+// method-specific; [RuleSet] implementations may type-assert to inspect it.
 type AuthInfo interface {
 	// Method returns the SOCKS5 method byte that produced this info.
 	Method() byte
 }
 
-// NoAuthInfo is the AuthInfo produced by [NoAuthAuthenticator].
+// NoAuthInfo is the [AuthInfo] produced by [NoAuthAuthenticator].
 type NoAuthInfo struct{}
 
 func (NoAuthInfo) Method() byte { return methodNoAuth }
 
-// UserPassInfo is the AuthInfo produced by [UserPassAuthenticator] on success.
-// Username is available to [RuleSet] implementations.
+// UserPassInfo is the [AuthInfo] produced by [UserPassAuthenticator] on success.
+// Username is available to [RuleSet] implementations via a type assertion.
 type UserPassInfo struct{ Username string }
 
 func (UserPassInfo) Method() byte { return methodUserPass }
 
-// ── Authenticator interface ───────────────────────────────────────────────────
-
 // Authenticator handles a single SOCKS5 authentication method.
 //
-// The server calls [Authenticator.Authenticate] only AFTER it has already
-// written the method-selection response byte to the client, so implementations
-// should only perform the method-specific sub-negotiation.
+// The server calls Authenticate only after it has written the method-selection
+// byte to the client, so implementations should perform only the
+// method-specific sub-negotiation (not the method selection itself).
+//
+// For username/password authentication, use [UserPassAuth] or
+// [UserPassAuthMulti] instead of implementing this interface.
 type Authenticator interface {
 	// Code returns the SOCKS5 method byte this authenticator handles.
 	Code() byte
-	// Authenticate performs the method-specific sub-negotiation on conn.
-	// Returns [AuthInfo] on success, or an error that causes the server to
-	// close the connection.
+	// Authenticate performs the method sub-negotiation on conn and returns
+	// [AuthInfo] on success, or an error that causes the server to close the
+	// connection.
 	Authenticate(conn net.Conn) (AuthInfo, error)
 }
 
-// ── NoAuthAuthenticator ───────────────────────────────────────────────────────
-
 // NoAuthAuthenticator implements SOCKS5 method 0x00 (no authentication).
 // The sub-negotiation is empty; Authenticate returns immediately.
+// This is the default when [Config.Authenticators] is nil.
 type NoAuthAuthenticator struct{}
 
 func (NoAuthAuthenticator) Code() byte { return methodNoAuth }
@@ -67,20 +94,21 @@ func (NoAuthAuthenticator) Authenticate(_ net.Conn) (AuthInfo, error) {
 	return NoAuthInfo{}, nil
 }
 
-// ── UserPassAuthenticator ─────────────────────────────────────────────────────
-
 // UserPassAuthenticator implements RFC 1929 username/password authentication
 // (SOCKS5 method 0x02).
+//
+// Prefer [UserPassAuth] for a single user and [UserPassAuthMulti] for multiple
+// users. Use this type directly only when you need a custom [CredentialStore].
 type UserPassAuthenticator struct {
-	// Credentials is the store consulted to validate username/password pairs.
-	// It must not be nil.
+	// Credentials validates username/password pairs. Must not be nil;
+	// [NewServer] returns an error if it is.
 	Credentials CredentialStore
 }
 
 func (a UserPassAuthenticator) Code() byte { return methodUserPass }
 
-// Authenticate performs the RFC 1929 sub-negotiation, validates credentials
-// against a.Credentials, and returns [UserPassInfo] on success.
+// Authenticate performs the RFC 1929 sub-negotiation and returns [UserPassInfo]
+// on success.
 //
 // Wire format — request:  VER(1) | ULEN(1) | UNAME(1-255) | PLEN(1) | PASSWD(1-255)
 // Wire format — response: VER(1) | STATUS(1)
@@ -92,8 +120,42 @@ func (a UserPassAuthenticator) Authenticate(conn net.Conn) (AuthInfo, error) {
 	return UserPassInfo{Username: username}, nil
 }
 
-// doUserPassAuth is the stateless RFC 1929 wire implementation shared by
-// UserPassAuthenticator. It returns the authenticated username on success.
+// CredentialStore validates username/password pairs.
+// Implementations must use constant-time comparison to prevent timing attacks.
+//
+// For a single pair, use [StaticCredentials]. For multiple users, use [MapCredentials].
+type CredentialStore interface {
+	Valid(username, password string) bool
+}
+
+// StaticCredentials is a single-pair [CredentialStore]. Both comparisons are
+// constant-time (SHA-256 normalised) to resist timing side-channels.
+type StaticCredentials struct {
+	Username, Password string
+}
+
+func (s StaticCredentials) Valid(username, password string) bool {
+	return constantTimeEqual([]byte(username), []byte(s.Username)) &&
+		constantTimeEqual([]byte(password), []byte(s.Password))
+}
+
+// MapCredentials is a multi-user [CredentialStore] backed by a username →
+// password map. Map lookup is not constant-time (timing reveals whether a
+// username exists), but password comparison is. Suitable when the username
+// list is not sensitive.
+type MapCredentials map[string]string
+
+func (m MapCredentials) Valid(username, password string) bool {
+	stored, ok := m[username]
+	if !ok {
+		constantTimeEqual([]byte(password), nil) // dummy comparison; avoids timing oracle
+		return false
+	}
+	return constantTimeEqual([]byte(password), []byte(stored))
+}
+
+// doUserPassAuth is the stateless RFC 1929 wire implementation.
+// Returns the authenticated username on success.
 func doUserPassAuth(rw io.ReadWriter, store CredentialStore) (string, error) {
 	var header [2]byte
 	if _, err := io.ReadFull(rw, header[:]); err != nil {
@@ -103,7 +165,6 @@ func doUserPassAuth(rw io.ReadWriter, store CredentialStore) (string, error) {
 		return "", fmt.Errorf("unsupported auth sub-version: %#x (want %#x)", header[0], authSubVersion)
 	}
 	if header[1] == 0 {
-		// Best-effort: the error return signals failure to the caller.
 		_, _ = rw.Write([]byte{authSubVersion, authFailure})
 		return "", errors.New("ULEN is 0: username must be 1-255 bytes (RFC 1929 §2)")
 	}
@@ -140,45 +201,10 @@ func doUserPassAuth(rw io.ReadWriter, store CredentialStore) (string, error) {
 	return string(username), nil
 }
 
-// ── CredentialStore ───────────────────────────────────────────────────────────
-
-// CredentialStore validates username/password pairs.
-// Implementations should use constant-time comparison to prevent timing attacks.
-type CredentialStore interface {
-	Valid(username, password string) bool
-}
-
-// StaticCredentials is a single-pair credential store. Both comparisons are
-// constant-time (SHA-256 normalised) to resist timing side-channels.
-type StaticCredentials struct {
-	Username, Password string
-}
-
-func (s StaticCredentials) Valid(username, password string) bool {
-	return constantTimeEqual([]byte(username), []byte(s.Username)) &&
-		constantTimeEqual([]byte(password), []byte(s.Password))
-}
-
-// MapCredentials is a multi-user credential store backed by a map of
-// username → password. The map lookup is not constant-time (the map
-// reveals whether the username exists via timing), but password comparison
-// is. Suitable when the username list is not sensitive.
-type MapCredentials map[string]string
-
-func (m MapCredentials) Valid(username, password string) bool {
-	stored, ok := m[username]
-	if !ok {
-		// Run a dummy comparison to avoid a trivial timing oracle on usernames.
-		constantTimeEqual([]byte(password), nil)
-		return false
-	}
-	return constantTimeEqual([]byte(password), []byte(stored))
-}
-
-// constantTimeEqual compares two byte slices in constant time regardless
-// of length. subtle.ConstantTimeCompare returns 0 immediately when lengths
-// differ, leaking length information via timing; hashing to fixed-size
-// 32-byte arrays first eliminates that.
+// constantTimeEqual compares two byte slices in constant time regardless of
+// length. subtle.ConstantTimeCompare returns 0 immediately when lengths differ,
+// leaking length via timing; hashing both to 32-byte SHA-256 digests first
+// eliminates that.
 func constantTimeEqual(a, b []byte) bool {
 	ha := sha256.Sum256(a)
 	hb := sha256.Sum256(b)

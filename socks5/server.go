@@ -1,7 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// server.go is the public entry point: Config, Server, NewServer,
-// ListenAndServe, and Serve.
+// Package socks5 implements an embeddable SOCKS5 proxy server (RFC 1928 / RFC 1929).
+//
+// # Quick start
+//
+// The simplest server accepts all connections without authentication:
+//
+//	srv, _ := socks5.NewServer(socks5.Config{})
+//	srv.ListenAndServe(ctx, ":1080")
+//
+// Add username/password authentication with a single call:
+//
+//	srv, _ := socks5.NewServer(socks5.Config{
+//	    Authenticators: []socks5.Authenticator{
+//	        socks5.UserPassAuth("alice", "s3cr3t"),
+//	    },
+//	})
+//
+// Support multiple users:
+//
+//	srv, _ := socks5.NewServer(socks5.Config{
+//	    Authenticators: []socks5.Authenticator{
+//	        socks5.UserPassAuthMulti(map[string]string{
+//	            "alice": "s3cr3t",
+//	            "bob":   "hunter2",
+//	        }),
+//	    },
+//	})
+//
+// # Supported SOCKS5 features
+//
+//   - CONNECT (0x01): TCP tunneling to IPv4, IPv6, and domain-name destinations
+//   - UDP ASSOCIATE (0x03): datagram relay with SOCKS5 encapsulation;
+//     fragmentation is not supported (RFC 1928 §7 permits dropping it)
+//   - No-auth (0x00) and username/password (0x02) authentication (RFC 1929)
+//   - Trusted-IP bypass ([Config.TrustedIPs]) and auth-once promotion ([Config.AuthOnce])
+//
+// BIND (0x02) is rejected with reply 0x07 (command not supported).
+// GSSAPI (method 0x01) is not implemented; clients that offer only GSSAPI
+// receive reply 0xFF (no acceptable method). RFC 1928 §3 marks GSSAPI as
+// MUST, but it is absent from virtually all deployed SOCKS5 implementations.
+//
+// # Extension points
+//
+// Every component is replaceable through interfaces:
+//   - [Authenticator] / [CredentialStore] — custom authentication logic
+//   - [RuleSet] — per-request access control
+//   - [Resolver] — custom DNS resolution for the UDP relay path
+//   - [DialFunc] — custom outbound TCP (proxy chaining, metrics, TLS, etc.)
 package socks5
 
 import (
@@ -29,85 +75,85 @@ const (
 	defaultMaxConns = 1024
 )
 
-// Config holds all settings for a SOCKS5 server.
-// All fields are read-only after being passed to [NewServer].
+// Config holds all settings for a SOCKS5 server. All fields have sensible
+// defaults — a zero-value Config starts an open proxy that accepts every
+// connection. All fields are read-only after being passed to [NewServer].
 type Config struct {
-	// Logger is used for all server-level and session-level log output.
+	// Logger receives all server-level and session-level log output.
 	// Defaults to [slog.Default] when nil.
 	Logger *slog.Logger
 
-	// Authenticators is the ordered list of authentication methods the server
-	// supports. The server selects the first method that the client also
-	// offers. Defaults to [NoAuthAuthenticator{}] when empty.
+	// Authenticators is the ordered list of authentication methods offered to
+	// clients. The server selects the first method the client also supports.
+	//
+	// For most servers, set exactly one entry using [UserPassAuth]:
+	//
+	//   Authenticators: []socks5.Authenticator{socks5.UserPassAuth("alice", "s3cr3t")}
+	//
+	// Leave nil (or empty) to accept unauthenticated connections.
 	Authenticators []Authenticator
 
 	// Rules gates each request before any outbound connection is made.
-	// Defaults to [PermitAll] when nil.
+	// Defaults to [PermitAll] when nil. Use [PermitCommand] to restrict which
+	// SOCKS5 commands clients may issue.
 	Rules RuleSet
 
-	// Resolver resolves domain names for UDP ASSOCIATE relay. TCP CONNECT
-	// lets the [DialFunc] handle DNS internally.
+	// Resolver resolves domain names for the UDP ASSOCIATE relay path.
+	// TCP CONNECT lets [Dial] handle DNS internally.
 	// Defaults to [DefaultResolver] when nil.
 	Resolver Resolver
 
 	// Dial establishes outgoing TCP connections for CONNECT requests.
 	// The context it receives already carries a deadline equal to DialTimeout.
 	// Defaults to a [net.Dialer] bound to BindAddr (if set).
-	// Mutually exclusive with BindAddr: setting both is an error.
+	//
+	// Mutually exclusive with BindAddr: providing both is an error in [NewServer].
 	Dial DialFunc
 
-	// BindAddr, when non-empty, pins all outgoing TCP connections to this
-	// local IP address (e.g. "203.0.113.1" or "2001:db8::1").
-	// Parsed and validated by [NewServer]. Mutually exclusive with Dial.
+	// BindAddr pins all outgoing TCP connections to this local IP address
+	// (e.g. "203.0.113.1" or "2001:db8::1"). Parsed and validated by [NewServer].
+	//
+	// Mutually exclusive with Dial: providing both is an error in [NewServer].
 	BindAddr string
+
+	// TrustedIPs lists client source addresses that bypass authentication even
+	// when Authenticators require credentials. IPv4 and IPv4-mapped IPv6 forms
+	// are normalised before comparison.
+	TrustedIPs []netip.Addr
+
+	// AuthOnce, when true, adds a client IP to TrustedIPs after its first
+	// successful authentication. Subsequent connections from that IP skip auth.
+	// Has no effect when all Authenticators accept unauthenticated clients.
+	AuthOnce bool
 
 	// MaxConns limits concurrent client connections. Zero means 1024.
 	MaxConns int
-
-	// TrustedIPs lists client source addresses that bypass authentication
-	// even when Authenticators require credentials. IPv4 and IPv4-mapped IPv6
-	// forms are treated as equal (equivalent to microsocks -w).
-	TrustedIPs []netip.Addr
-
-	// AuthOnce, when true, promotes a client IP to the trusted list after its
-	// first successful authentication. Subsequent connections from that IP
-	// skip auth (equivalent to microsocks -1). Has no effect when all
-	// Authenticators accept unauthenticated clients.
-	AuthOnce bool
 
 	// HandshakeTimeout limits the total time allowed for the greeting,
 	// authentication, and request phases. Zero means 30 seconds.
 	HandshakeTimeout time.Duration
 
-	// DialTimeout limits the time for establishing each outbound TCP
-	// connection. The context passed to [DialFunc] carries this deadline.
+	// DialTimeout limits the time for each outbound TCP connection.
 	// Zero means 30 seconds.
 	DialTimeout time.Duration
 
-	// TCPIdleTimeout closes TCP relay connections that have been idle for
-	// this long. Zero means 5 minutes.
+	// TCPIdleTimeout closes TCP relay connections idle for this long.
+	// Zero means 5 minutes.
 	TCPIdleTimeout time.Duration
 
-	// UDPIdleTimeout tears down UDP associations that have been idle for
-	// this long. Zero means 5 minutes.
+	// UDPIdleTimeout tears down UDP associations idle for this long.
+	// Zero means 5 minutes.
 	UDPIdleTimeout time.Duration
 }
 
-// serverTimeouts holds resolved (non-zero) timeout values for use at runtime.
-type serverTimeouts struct {
-	handshake time.Duration
-	dial      time.Duration
-	tcpIdle   time.Duration
-	udpIdle   time.Duration
-}
-
-// Server is a SOCKS5 proxy server.
+// Server is a ready-to-run SOCKS5 proxy. Create one with [NewServer], then
+// call [Server.ListenAndServe] or [Server.Serve].
 type Server struct {
 	cfg      Config
 	sem      chan struct{}
 	timeouts serverTimeouts
 
-	// Resolved interface defaults — always non-nil after NewServer.
+	// Resolved interface values — always non-nil after NewServer.
 	dial     DialFunc
 	resolver Resolver
 	rules    RuleSet
@@ -118,6 +164,14 @@ type Server struct {
 	trustedIPs map[netip.Addr]bool
 }
 
+// serverTimeouts holds resolved (non-zero) timeout values for use at runtime.
+type serverTimeouts struct {
+	handshake time.Duration
+	dial      time.Duration
+	tcpIdle   time.Duration
+	udpIdle   time.Duration
+}
+
 // NewServer creates a Server from cfg, validates the configuration, and fills
 // in defaults for nil interface fields and zero timeout values.
 //
@@ -126,7 +180,6 @@ type Server struct {
 //   - BindAddr is non-empty but not a valid IP address.
 //   - A [UserPassAuthenticator] has a nil [CredentialStore].
 func NewServer(cfg Config) (*Server, error) {
-	// Mutual exclusion: Dial and BindAddr serve the same purpose.
 	if cfg.Dial != nil && cfg.BindAddr != "" {
 		return nil, fmt.Errorf("socks5: Dial and BindAddr are mutually exclusive; provide one or the other")
 	}
@@ -170,15 +223,15 @@ func NewServer(cfg Config) (*Server, error) {
 		to.udpIdle = defaultUDPIdleTimeout
 	}
 
-	// Validate every UserPassAuthenticator upfront: a nil CredentialStore
-	// would otherwise panic on the first authentication attempt.
+	// Validate every UserPassAuthenticator upfront to avoid a nil-dereference
+	// panic on the first authentication attempt.
 	for i, a := range cfg.Authenticators {
 		if upa, ok := a.(UserPassAuthenticator); ok && upa.Credentials == nil {
 			return nil, fmt.Errorf("socks5: Authenticators[%d] (UserPassAuthenticator) has a nil Credentials store", i)
 		}
 	}
 
-	// Build the outbound dialer when the caller hasn't provided one.
+	// Build the outbound dialer when the caller has not provided one.
 	var dial DialFunc
 	if cfg.Dial != nil {
 		dial = cfg.Dial
@@ -211,32 +264,8 @@ func NewServer(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// isTrusted reports whether ip is in the runtime trusted set.
-func (s *Server) isTrusted(ip netip.Addr) bool {
-	if !ip.IsValid() {
-		return false
-	}
-	s.trustedMu.RLock()
-	defer s.trustedMu.RUnlock()
-	return s.trustedIPs[ip.Unmap()]
-}
-
-// addTrusted inserts ip into the runtime trusted set (idempotent).
-func (s *Server) addTrusted(ip netip.Addr) {
-	if !ip.IsValid() {
-		return
-	}
-	ip = ip.Unmap()
-	s.trustedMu.Lock()
-	defer s.trustedMu.Unlock()
-	if s.trustedIPs == nil {
-		s.trustedIPs = make(map[netip.Addr]bool)
-	}
-	s.trustedIPs[ip] = true
-}
-
 // ListenAndServe binds to addr and serves SOCKS5 connections until ctx is
-// cancelled. On shutdown it waits for all active sessions to finish.
+// cancelled, then waits for all active sessions to finish.
 //
 // addr uses the same format as [net.Listen] (e.g. ":1080" or "[::]:1080").
 func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
@@ -290,4 +319,28 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			newSession(conn, s).handle()
 		}()
 	}
+}
+
+// isTrusted reports whether ip is in the runtime trusted set.
+func (s *Server) isTrusted(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	s.trustedMu.RLock()
+	defer s.trustedMu.RUnlock()
+	return s.trustedIPs[ip.Unmap()]
+}
+
+// addTrusted inserts ip into the runtime trusted set (idempotent).
+func (s *Server) addTrusted(ip netip.Addr) {
+	if !ip.IsValid() {
+		return
+	}
+	ip = ip.Unmap()
+	s.trustedMu.Lock()
+	defer s.trustedMu.Unlock()
+	if s.trustedIPs == nil {
+		s.trustedIPs = make(map[netip.Addr]bool)
+	}
+	s.trustedIPs[ip] = true
 }

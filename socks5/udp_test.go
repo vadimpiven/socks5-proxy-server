@@ -3,6 +3,7 @@
 package socks5
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -11,15 +12,11 @@ import (
 	"time"
 )
 
-// ── RFC 1928 §7 — UDP header parsing edge cases ──────────────────────────────
-//
-// The happy-path parsing (IPv4, IPv6, domain, empty payload) is covered by
-// TestUDPHeaderRoundtrip and the integration tests below.
-// These tests exercise RFC-mandated drop conditions and normalization that
-// cannot be triggered through a normal client.
+// Happy-path parsing (IPv4, IPv6, domain, empty payload) is covered by
+// TestUDPHeaderRoundtrip and the integration tests. The cases below exercise
+// RFC-mandated drop conditions and normalisation that cannot be triggered
+// through a normal client.
 
-// TestParseUDPHeader_TooShort verifies that datagrams shorter than the
-// minimum header size are rejected.
 func TestParseUDPHeader_TooShort(t *testing.T) {
 	_, _, err := parseUDPHeader([]byte{0x00, 0x00, 0x00})
 	if err == nil {
@@ -30,7 +27,7 @@ func TestParseUDPHeader_TooShort(t *testing.T) {
 // TestParseUDPHeader_NonZeroRSV verifies that datagrams with a non-zero RSV
 // field are rejected. RFC 1928 §7 specifies RSV = X'0000'.
 func TestParseUDPHeader_NonZeroRSV(t *testing.T) {
-	b := []byte{0x00, 0x01 /*RSV[1]!=0*/, 0x00, addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50}
+	b := []byte{0x00, 0x01, 0x00, addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50}
 	_, _, err := parseUDPHeader(b)
 	if err == nil {
 		t.Fatal("expected error for non-zero RSV in UDP header")
@@ -41,26 +38,26 @@ func TestParseUDPHeader_NonZeroRSV(t *testing.T) {
 // are rejected. RFC 1928 §7: "An implementation that does not support
 // fragmentation MUST drop any datagram whose FRAG field is other than X'00'."
 func TestParseUDPHeader_FragmentedDropped(t *testing.T) {
-	b := []byte{0x00, 0x00, 0x01 /*FRAG=1*/, addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50}
+	b := []byte{0x00, 0x00, 0x01, addrTypeIPv4, 1, 2, 3, 4, 0x00, 0x50}
 	_, _, err := parseUDPHeader(b)
 	if err == nil {
 		t.Fatal("expected error for fragmented UDP datagram (FRAG != 0)")
 	}
 }
 
-// TestBuildUDPResponse_IPv4MappedNormalised verifies that the response header
-// built for an IPv4-mapped IPv6 source address (::ffff:a.b.c.d) uses
-// ATYP=0x01 (IPv4) rather than ATYP=0x04 (IPv6). This normalisation ensures
-// clients that do not handle IPv6 can parse the source address correctly.
-func TestBuildUDPResponse_IPv4MappedNormalised(t *testing.T) {
+// TestAppendUDPResponse_IPv4MappedNormalised verifies that the response header
+// for an IPv4-mapped IPv6 source (::ffff:a.b.c.d) uses ATYP=0x01 (IPv4).
+// Clients that don't handle IPv6 can parse the source address correctly.
+func TestAppendUDPResponse_IPv4MappedNormalised(t *testing.T) {
 	from := netip.MustParseAddrPort("[::ffff:192.0.2.1]:9")
-	resp := buildUDPResponse(from, nil)
-	if resp[3] != addrTypeIPv4 {
-		t.Fatalf("ATYP = %#x, want 0x01 (IPv4) for IPv4-mapped source", resp[3])
+	var dst [udpResponseBufSize]byte
+	appendUDPResponse(dst[:], from, nil)
+	if dst[3] != addrTypeIPv4 {
+		t.Fatalf("ATYP = %#x, want 0x01 (IPv4) for IPv4-mapped source", dst[3])
 	}
 }
 
-// TestUDPHeaderRoundtrip verifies that buildUDPResponse and parseUDPHeader
+// TestUDPHeaderRoundtrip verifies that appendUDPResponse and parseUDPHeader
 // are inverses of each other across all address families.
 func TestUDPHeaderRoundtrip(t *testing.T) {
 	cases := []struct {
@@ -71,7 +68,10 @@ func TestUDPHeaderRoundtrip(t *testing.T) {
 		{netip.MustParseAddrPort("[2001:db8::1]:443"), "ipv6 payload"},
 	}
 	for _, tc := range cases {
-		encoded := buildUDPResponse(tc.from, []byte(tc.payload))
+		dst := make([]byte, udpResponseBufSize)
+		n := appendUDPResponse(dst, tc.from, []byte(tc.payload))
+		encoded := dst[:n]
+
 		dest, payload, err := parseUDPHeader(encoded)
 		if err != nil {
 			t.Fatalf("parseUDPHeader: %v", err)
@@ -87,8 +87,6 @@ func TestUDPHeaderRoundtrip(t *testing.T) {
 		}
 	}
 }
-
-// ── Integration tests ────────────────────────────────────────────────────────
 
 // startUDPEchoServer starts a UDP server that echoes every datagram back to
 // its sender.
@@ -132,7 +130,7 @@ func doUDPAssociate(t *testing.T, proxyAddr string) (ctrl net.Conn, relayAddr *n
 		t.Fatalf("method = %#x, want NoAuth", resp[1])
 	}
 
-	// RFC 1928 §7: use all-zeros hint when client UDP address is not known.
+	// RFC 1928 §7: use all-zeros hint when the client UDP address is not known.
 	ctrl.Write([]byte{version5, byte(CommandUDPAssociate), 0x00, addrTypeIPv4, 0, 0, 0, 0, 0, 0})
 
 	reply := make([]byte, 4)
@@ -164,10 +162,9 @@ func doUDPAssociate(t *testing.T, proxyAddr string) (ctrl net.Conn, relayAddr *n
 }
 
 // TestUDPAssociate_EchoRoundtrip is the primary UDP integration test.
-// It verifies:
-//   - The relay correctly forwards a client datagram to the destination.
-//   - The reply is encapsulated with a SOCKS5 UDP header (RFC 1928 §7).
-//   - The reported source in the reply matches the echo server's address.
+// It verifies that the relay forwards a client datagram to the destination,
+// encapsulates the reply with a SOCKS5 header, and reports the correct source
+// address (RFC 1928 §7).
 func TestUDPAssociate_EchoRoundtrip(t *testing.T) {
 	echoAddr := startUDPEchoServer(t)
 	proxyAddr, cancel := startProxy(t, Config{})
@@ -214,10 +211,10 @@ func TestUDPAssociate_EchoRoundtrip(t *testing.T) {
 	}
 }
 
-// TestUDPAssociate_PortChangingRemote verifies RFC 1928 §7 compliance: the
-// relay MUST forward replies from remote hosts regardless of which source port
-// they use. This covers load balancers and NAT devices that reply from a
-// different port than the one they listen on.
+// TestUDPAssociate_PortChangingRemote verifies RFC 1928 §7: the relay must
+// forward replies from remote hosts regardless of source port. This covers
+// load balancers and NAT devices that reply from a different port than they
+// listen on.
 func TestUDPAssociate_PortChangingRemote(t *testing.T) {
 	proxyAddr, cancel := startProxy(t, Config{})
 	defer cancel()
@@ -240,8 +237,7 @@ func TestUDPAssociate_PortChangingRemote(t *testing.T) {
 		if err != nil {
 			return
 		}
-		// Reply from a DIFFERENT port — the port-changing case.
-		replyConn.WriteToUDP(buf[:n], from)
+		replyConn.WriteToUDP(buf[:n], from) // reply from a different port
 	}()
 
 	ctrl, relayAddr := doUDPAssociate(t, proxyAddr)
@@ -277,9 +273,71 @@ func TestUDPAssociate_PortChangingRemote(t *testing.T) {
 	}
 }
 
-// TestUDPAssociate_AssociationEndsWithTCP verifies RFC 1928 §7:
-// "A UDP association terminates when the TCP connection that the UDP ASSOCIATE
-// request arrived on terminates."
+// fixedIPResolver is a test-only [Resolver] that always returns a pre-set
+// address, letting UDP domain tests control resolution without depending on
+// system DNS or the address family that "localhost" happens to resolve to.
+type fixedIPResolver struct{ addr netip.Addr }
+
+func (r fixedIPResolver) Resolve(_ context.Context, _ string) (netip.Addr, error) {
+	return r.addr, nil
+}
+
+// TestUDPAssociate_DomainDestination verifies that the UDP relay resolves a
+// DOMAINNAME destination (ATYP=0x03) in a client datagram and forwards the
+// payload to the resolved address (RFC 1928 §7).
+//
+// A fixed resolver is used so the test is independent of system DNS and
+// address-family selection.
+func TestUDPAssociate_DomainDestination(t *testing.T) {
+	echoAddr := startUDPEchoServer(t)
+
+	// Use a resolver that always returns 127.0.0.1 so the relay stays on
+	// the same IPv4 network as the echo server and the relay socket.
+	proxyAddr, cancel := startProxy(t, Config{
+		Resolver: fixedIPResolver{netip.MustParseAddr("127.0.0.1")},
+	})
+	defer cancel()
+
+	ctrl, relayAddr := doUDPAssociate(t, proxyAddr)
+	defer ctrl.Close()
+
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConn.Close()
+	udpConn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	msg := []byte("domain-udp-test")
+	domain := "echo.test" // arbitrary; fixedIPResolver ignores the name
+
+	// Build a SOCKS5 UDP request with ATYP=0x03 (DOMAINNAME).
+	datagram := []byte{0x00, 0x00, 0x00, addrTypeDomain, byte(len(domain))}
+	datagram = append(datagram, []byte(domain)...)
+	datagram = binary.BigEndian.AppendUint16(datagram, uint16(echoAddr.Port))
+	datagram = append(datagram, msg...)
+
+	if _, err := udpConn.WriteTo(datagram, relayAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, udpBufSize)
+	n, _, err := udpConn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom relay: %v", err)
+	}
+
+	_, payload, err := parseUDPHeader(buf[:n])
+	if err != nil {
+		t.Fatalf("parseUDPHeader on reply: %v", err)
+	}
+	if string(payload) != string(msg) {
+		t.Fatalf("payload = %q, want %q", payload, msg)
+	}
+}
+
+// TestUDPAssociate_AssociationEndsWithTCP verifies RFC 1928 §7: the UDP
+// association must terminate when the TCP control connection closes.
 func TestUDPAssociate_AssociationEndsWithTCP(t *testing.T) {
 	echoAddr := startUDPEchoServer(t)
 	proxyAddr, cancel := startProxy(t, Config{})
@@ -298,7 +356,7 @@ func TestUDPAssociate_AssociationEndsWithTCP(t *testing.T) {
 	datagram = binary.BigEndian.AppendUint16(datagram, uint16(echoAddr.Port))
 	datagram = append(datagram, "probe"...)
 
-	// Confirm relay is working before closing TCP.
+	// Confirm relay is working before closing the TCP connection.
 	udpConn.SetDeadline(time.Now().Add(3 * time.Second))
 	udpConn.WriteTo(datagram, relayAddr)
 	buf := make([]byte, udpBufSize)
@@ -306,11 +364,10 @@ func TestUDPAssociate_AssociationEndsWithTCP(t *testing.T) {
 		t.Fatalf("relay not working before TCP close: %v", err)
 	}
 
-	// Close the TCP control connection.
 	ctrl.Close()
 	time.Sleep(100 * time.Millisecond)
 
-	// Relay must now be torn down: datagrams sent to it receive no response.
+	// Relay must now be torn down.
 	udpConn.SetDeadline(time.Now().Add(500 * time.Millisecond))
 	udpConn.WriteTo(datagram, relayAddr)
 	if n, _, err := udpConn.ReadFrom(buf); err == nil {

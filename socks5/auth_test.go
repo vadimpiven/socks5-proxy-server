@@ -21,19 +21,80 @@ func pipeWithDeadline(t *testing.T) (client, server net.Conn) {
 	return c, s
 }
 
-// ── UserPassAuthenticator — RFC 1929 §2 edge cases ──────────────────────────
-//
-// The happy paths (correct credentials → success, wrong password → failure)
-// are covered end-to-end by TestFullSession_UserPass_Connect and
-// TestFullSession_AuthFailure in server_test.go.
-// The tests below cover RFC 1929 §2 wire constraints that are deliberately
-// violated by a malformed client and cannot be exercised through proxy.SOCKS5.
+// TestUserPassAuth verifies that [UserPassAuth] returns a working RFC 1929
+// authenticator that accepts the configured credential pair.
+func TestUserPassAuth(t *testing.T) {
+	client, server := pipeWithDeadline(t)
+	auth := UserPassAuth("alice", "secret")
 
-// TestUserPassAuth_BadSubVersion verifies that the server rejects an auth
+	if auth.Code() != methodUserPass {
+		t.Fatalf("Code() = %#x, want %#x (methodUserPass)", auth.Code(), methodUserPass)
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := auth.Authenticate(server)
+		errc <- err
+	}()
+
+	// RFC 1929 sub-negotiation: VER | ULEN | UNAME | PLEN | PASSWD
+	pkt := []byte{authSubVersion, 5, 'a', 'l', 'i', 'c', 'e', 6, 's', 'e', 'c', 'r', 'e', 't'}
+	client.Write(pkt)
+
+	resp := make([]byte, 2)
+	io.ReadFull(client, resp)
+	if resp[0] != authSubVersion {
+		t.Fatalf("auth response VER = %#x, want 0x01 (RFC 1929 §2)", resp[0])
+	}
+	if resp[1] != authSuccess {
+		t.Fatalf("STATUS = %#x, want 0x00 (success)", resp[1])
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+}
+
+// TestUserPassAuthMulti verifies that [UserPassAuthMulti] accepts any
+// credential pair from the provided map.
+func TestUserPassAuthMulti(t *testing.T) {
+	creds := map[string]string{"alice": "secret", "bob": "pass"}
+
+	for user, pass := range creds {
+		t.Run(user, func(t *testing.T) {
+			client, server := pipeWithDeadline(t)
+			auth := UserPassAuthMulti(creds)
+
+			errc := make(chan error, 1)
+			go func() {
+				_, err := auth.Authenticate(server)
+				errc <- err
+			}()
+
+			pkt := append([]byte{authSubVersion, byte(len(user))}, []byte(user)...)
+			pkt = append(pkt, byte(len(pass)))
+			pkt = append(pkt, []byte(pass)...)
+			client.Write(pkt)
+
+			resp := make([]byte, 2)
+			io.ReadFull(client, resp)
+			if resp[0] != authSubVersion {
+				t.Fatalf("auth response VER = %#x, want 0x01 (RFC 1929 §2)", resp[0])
+			}
+			if resp[1] != authSuccess {
+				t.Fatalf("STATUS = %#x, want 0x00 (success) for user %q", resp[1], user)
+			}
+			if err := <-errc; err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+		})
+	}
+}
+
+// TestUserPassAuth_BadSubVersion verifies that the server rejects a
 // sub-negotiation whose VER field is not 0x01 (RFC 1929 §2).
 func TestUserPassAuth_BadSubVersion(t *testing.T) {
 	client, server := pipeWithDeadline(t)
-	a := UserPassAuthenticator{Credentials: StaticCredentials{Username: "u", Password: "p"}}
+	a := UserPassAuth("u", "p")
 
 	errc := make(chan error, 1)
 	go func() {
@@ -41,19 +102,20 @@ func TestUserPassAuth_BadSubVersion(t *testing.T) {
 		errc <- err
 	}()
 
-	// Sub-version 0x02 instead of 0x01 — server reads 2 bytes then rejects.
-	go client.Write([]byte{0x02, 0x01, 'u', 0x01, 'p'})
+	// Server returns after reading 2 bytes without consuming the rest; write
+	// in a goroutine to avoid deadlocking on net.Pipe's unbuffered transport.
+	go client.Write([]byte{0x02, 0x01, 'u', 0x01, 'p'}) // VER=0x02 instead of 0x01
 
 	if err := <-errc; err == nil {
 		t.Fatal("expected error for bad sub-negotiation version")
 	}
 }
 
-// TestUserPassAuth_ZeroLengthUsername verifies that the server rejects a
-// username length of 0 with STATUS=0x01 (RFC 1929 §2: ULEN is "1 to 255").
+// TestUserPassAuth_ZeroLengthUsername verifies that ULEN=0 is rejected with
+// STATUS=0x01 (RFC 1929 §2: ULEN is "1 to 255").
 func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
 	client, server := pipeWithDeadline(t)
-	a := UserPassAuthenticator{Credentials: StaticCredentials{Username: "u", Password: "p"}}
+	a := UserPassAuth("u", "p")
 
 	errc := make(chan error, 1)
 	go func() {
@@ -61,11 +123,15 @@ func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
 		errc <- err
 	}()
 
-	// ULEN=0 — server reads 2 bytes, sends failure, then rejects.
+	// Server reads 2 bytes (header) then writes failure without consuming the
+	// remaining bytes; write in a goroutine to avoid deadlocking on net.Pipe.
 	go client.Write([]byte{authSubVersion, 0x00, 0x01, 'p'})
 
 	resp := make([]byte, 2)
 	io.ReadFull(client, resp)
+	if resp[0] != authSubVersion {
+		t.Fatalf("auth response VER = %#x, want 0x01 (RFC 1929 §2)", resp[0])
+	}
 	if resp[1] != authFailure {
 		t.Fatalf("STATUS = %#x, want 0x01 (failure) for ULEN=0", resp[1])
 	}
@@ -74,11 +140,11 @@ func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
 	}
 }
 
-// TestUserPassAuth_ZeroLengthPassword verifies that the server rejects a
-// password length of 0 with STATUS=0x01 (RFC 1929 §2: PLEN is "1 to 255").
+// TestUserPassAuth_ZeroLengthPassword verifies that PLEN=0 is rejected with
+// STATUS=0x01 (RFC 1929 §2: PLEN is "1 to 255").
 func TestUserPassAuth_ZeroLengthPassword(t *testing.T) {
 	client, server := pipeWithDeadline(t)
-	a := UserPassAuthenticator{Credentials: StaticCredentials{Username: "u", Password: "p"}}
+	a := UserPassAuth("u", "p")
 
 	errc := make(chan error, 1)
 	go func() {
@@ -86,11 +152,13 @@ func TestUserPassAuth_ZeroLengthPassword(t *testing.T) {
 		errc <- err
 	}()
 
-	// PLEN=0 — server reads VER+ULEN+UNAME+PLEN, sends failure, then rejects.
-	go client.Write([]byte{authSubVersion, 0x01, 'u', 0x00})
+	client.Write([]byte{authSubVersion, 0x01, 'u', 0x00})
 
 	resp := make([]byte, 2)
 	io.ReadFull(client, resp)
+	if resp[0] != authSubVersion {
+		t.Fatalf("auth response VER = %#x, want 0x01 (RFC 1929 §2)", resp[0])
+	}
 	if resp[1] != authFailure {
 		t.Fatalf("STATUS = %#x, want 0x01 (failure) for PLEN=0", resp[1])
 	}
@@ -98,8 +166,6 @@ func TestUserPassAuth_ZeroLengthPassword(t *testing.T) {
 		t.Fatal("expected error for PLEN=0")
 	}
 }
-
-// ── CredentialStore implementations ─────────────────────────────────────────
 
 func TestStaticCredentials(t *testing.T) {
 	s := StaticCredentials{Username: "alice", Password: "secret"}

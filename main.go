@@ -63,12 +63,7 @@ func main() {
 
 	if *user != "" {
 		cfg.Authenticators = []socks5.Authenticator{
-			socks5.UserPassAuthenticator{
-				Credentials: socks5.StaticCredentials{
-					Username: *user,
-					Password: *pass,
-				},
-			},
+			socks5.UserPassAuth(*user, *pass),
 		}
 	}
 

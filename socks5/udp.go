@@ -2,12 +2,12 @@
 
 // udp.go implements the SOCKS5 UDP ASSOCIATE command (RFC 1928 §7).
 //
-// Design summary
-// ──────────────
+// # Design summary
+//
 // Each UDP ASSOCIATE creates one PacketConn (the "relay socket") on a random
 // port. The client is told to send its encapsulated UDP datagrams there.
 //
-// Direction detection uses a two-phase rule (see runUDPRelay for details):
+// Direction detection uses a two-phase rule:
 //
 //	Phase 1 — client UDP address not yet known:
 //	  • from.IP == clientTCPIP  →  client; learn the full address (IP:port)
@@ -15,23 +15,23 @@
 //
 //	Phase 2 — client UDP address known:
 //	  • from == clientUDPAddr (exact IP:port)  →  client
-//	  • from.IP == clientTCPIP, different port  →  remote on same host
-//	  • any other IP                            →  remote
+//	  • any other address                      →  remote
 //
-// This correctly handles the loopback case (client and remote on the same IP)
-// and remotes that reply from a port different from the one they listen on
-// (e.g. NAT devices, load balancers).
+// This correctly handles remotes that reply from a different port than they
+// listen on (e.g. NAT devices, load balancers), as well as the loopback case
+// where client and remote share the same IP.
 //
-// Fragmentation (FRAG != 0x00) is not implemented; such datagrams are dropped
+// Fragmentation (FRAG != 0x00) is not supported; such datagrams are dropped
 // silently, as explicitly permitted by RFC 1928 §7.
 //
 // Lifetime: the association is torn down when the TCP control connection
 // closes (monitored via io.Copy(io.Discard, …)) or the relay is idle for
-// udpIdleTimeout.
+// UDPIdleTimeout.
+//
+// This file is internal to the package.
 package socks5
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -46,14 +46,16 @@ const (
 	// udpBufSize is the maximum UDP datagram size we handle. The IP/UDP
 	// stack caps packets at ~65 507 bytes on IPv4.
 	udpBufSize = 64 * 1024
+
+	// udpResponseBufSize is the maximum size of a SOCKS5-wrapped UDP response:
+	// the largest possible header (22 bytes) plus a full-size payload.
+	udpResponseBufSize = 22 + udpBufSize
 )
 
 // handleUDPAssociate implements the SOCKS5 UDP ASSOCIATE command.
-//
-// clientHint is the DST.ADDR:DST.PORT the client supplied in the request;
-// it MAY be all zeros when the client does not know its UDP source address.
-// The authoritative client IP is taken from the TCP control connection.
-func (s *session) handleUDPAssociate(clientHint AddrSpec) {
+// The authoritative client IP is taken from the TCP control connection;
+// the DST.ADDR hint in the request is intentionally ignored per RFC 1928 §7.
+func (s *session) handleUDPAssociate() {
 	if !s.ap.Addr().IsValid() {
 		// Cannot enforce source-IP filtering without a known client IP.
 		// In practice this only happens in tests using net.Pipe.
@@ -71,7 +73,7 @@ func (s *session) handleUDPAssociate(clientHint AddrSpec) {
 
 	pc, err := net.ListenPacket(udpNet, ":0")
 	if err != nil {
-		s.log().Warn("UDP: failed to create relay socket", "err", err)
+		s.log.Warn("UDP: failed to create relay socket", "err", err)
 		_ = writeReply(s.conn, replyGeneralFailure, AddrSpec{})
 		gracefulClose(s.conn)
 		return
@@ -88,7 +90,7 @@ func (s *session) handleUDPAssociate(clientHint AddrSpec) {
 		return
 	}
 
-	s.log().Info("UDP association started", "relay_port", relayPort)
+	s.log.Info("UDP association started", "relay_port", relayPort)
 
 	// The association lives as long as the TCP control connection.
 	// io.Copy(io.Discard, …) blocks until the connection closes, then
@@ -106,30 +108,18 @@ func (s *session) handleUDPAssociate(clientHint AddrSpec) {
 		pc.Close()
 	}()
 
-	runUDPRelay(ctx, pc, s.ap.Addr(), s.srv.resolver, s.log(), s.srv.timeouts.udpIdle)
-	s.log().Info("UDP association ended", "relay_port", relayPort)
+	runUDPRelay(ctx, pc, s.ap.Addr(), s.srv.resolver, s.log, s.srv.timeouts.udpIdle)
+	s.log.Info("UDP association ended", "relay_port", relayPort)
 }
 
 // runUDPRelay is the core UDP relay loop.
 //
-//	client → relay  : parse SOCKS5 header, resolve dst via resolver, forward
-//	remote → relay  : wrap in SOCKS5 header, forward to client
+//	client → relay  : parse SOCKS5 header, resolve dst, forward raw payload
+//	remote → relay  : wrap payload in SOCKS5 header, forward to client
 //
-// Direction detection
-// ───────────────────
-// RFC 1928 §7 mandates IP-based filtering for CLIENT datagrams only; remote
-// replies may arrive from any source.
-//
-// Two-phase rule:
-//
-//	Phase 1 — clientUDPAddr not yet learned:
-//	  from.IP == clientIP → client; record full IP:port
-//	  otherwise           → remote; drop (no reply path)
-//
-//	Phase 2 — clientUDPAddr known:
-//	  from.String() == clientUDPAddr → client
-//	  from.IP == clientIP (diff port) → remote on same host (wrap & forward)
-//	  other IP                        → remote (wrap & forward)
+// Direction detection follows the two-phase rule described in the file header.
+// Both buf (read buffer) and wbuf (write buffer) are allocated once per
+// association to avoid per-packet heap pressure.
 func runUDPRelay(
 	ctx context.Context,
 	pc net.PacketConn,
@@ -138,12 +128,13 @@ func runUDPRelay(
 	log *slog.Logger,
 	idleTimeout time.Duration,
 ) {
+	buf := make([]byte, udpBufSize)
+	wbuf := make([]byte, udpResponseBufSize) // reused for every remote→client response
+
 	var (
 		clientUDPAddr    net.Addr
 		clientUDPAddrStr string
 	)
-
-	buf := make([]byte, udpBufSize)
 
 	for {
 		pc.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -158,9 +149,10 @@ func runUDPRelay(
 		}
 
 		fromUDP := from.(*net.UDPAddr)
-		fromIP := fromUDP.AddrPort().Addr().Unmap()
+		fromAP := fromUDP.AddrPort()
+		fromIP := fromAP.Addr().Unmap()
 
-		// ── Classify ─────────────────────────────────────────────────────
+		// Classify the datagram as client→remote or remote→client.
 		isClient := false
 		if clientUDPAddr == nil {
 			if fromIP == clientIP {
@@ -173,15 +165,13 @@ func runUDPRelay(
 		}
 
 		if isClient {
-			// ── Client → Remote ───────────────────────────────────────────
+			// Client → remote: strip the SOCKS5 header and forward.
 			dest, payload, err := parseUDPHeader(buf[:n])
 			if err != nil {
 				log.Debug("UDP: dropping client datagram", "from", from, "err", err)
 				continue
 			}
 
-			// Resolve domain names via the configured Resolver.
-			// IP destinations are used directly.
 			var dstAP netip.AddrPort
 			if dest.Domain != "" {
 				resolveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -200,26 +190,15 @@ func runUDPRelay(
 				log.Debug("UDP: forward to remote failed", "dst", dstAP, "err", err)
 			}
 
-		} else if fromIP == clientIP {
-			// ── Remote on same host (Phase 2, different port) ─────────────
-			// A service co-located with the client replies from a different
-			// port. Treat as remote: wrap and deliver.
-			if clientUDPAddr == nil {
-				continue
-			}
-			response := buildUDPResponse(fromUDP.AddrPort(), buf[:n])
-			if _, err := pc.WriteTo(response, clientUDPAddr); err != nil {
-				log.Debug("UDP: forward same-IP remote to client failed", "err", err)
-			}
-
 		} else {
-			// ── Remote → Client ───────────────────────────────────────────
+			// Remote → client: wrap payload in a SOCKS5 header and deliver.
+			// Covers both same-host-different-port and entirely different hosts.
 			if clientUDPAddr == nil {
-				continue
+				continue // client's UDP address not yet known; drop
 			}
-			response := buildUDPResponse(fromUDP.AddrPort(), buf[:n])
-			if _, err := pc.WriteTo(response, clientUDPAddr); err != nil {
-				log.Debug("UDP: forward remote to client failed", "err", err)
+			rn := appendUDPResponse(wbuf, fromAP, buf[:n])
+			if _, err := pc.WriteTo(wbuf[:rn], clientUDPAddr); err != nil {
+				log.Debug("UDP: forward to client failed", "from", from, "err", err)
 			}
 		}
 	}
@@ -233,8 +212,7 @@ func runUDPRelay(
 //	|  2   |  1   |  1   | Variable |    2     | Variable |
 //	+------+------+------+----------+----------+----------+
 //
-// Fragmented datagrams (FRAG != 0x00) are rejected; implementations that do
-// not support fragmentation MUST drop them (RFC 1928 §7).
+// Fragmented datagrams (FRAG != 0x00) are rejected per RFC 1928 §7.
 func parseUDPHeader(b []byte) (dest AddrSpec, payload []byte, err error) {
 	if len(b) < 4 {
 		return AddrSpec{}, nil, errors.New("UDP header too short")
@@ -245,35 +223,9 @@ func parseUDPHeader(b []byte) (dest AddrSpec, payload []byte, err error) {
 	if b[2] != 0x00 {
 		return AddrSpec{}, nil, fmt.Errorf("fragmented UDP datagram (FRAG=%#x)", b[2])
 	}
-
-	// Reuse readAddr by wrapping the remainder in a bytes.Reader.
-	// Track bytes consumed to locate the payload start.
-	r := bytes.NewReader(b[3:])
-	before := r.Len()
-	dest, err = readAddr(r)
+	dest, n, err := parseAddrFromBytes(b[3:])
 	if err != nil {
 		return AddrSpec{}, nil, fmt.Errorf("parse UDP destination: %w", err)
 	}
-	consumed := before - r.Len()
-
-	return dest, b[3+consumed:], nil
-}
-
-// buildUDPResponse wraps a raw payload in a SOCKS5 UDP response header
-// (RFC 1928 §7) for delivery to the client. from is the remote source.
-//
-//	+------+------+------+----------+----------+----------+
-//	| RSV  | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-//	+------+------+------+----------+----------+----------+
-//	| 0000 | 0x00 |  …   |    …     |    …     |    …     |
-func buildUDPResponse(from netip.AddrPort, payload []byte) []byte {
-	src := AddrSpec{IP: from.Addr().Unmap(), Port: from.Port()}
-
-	// Pre-allocate: RSV(2) + FRAG(1) + addr encoding + port(2) + payload.
-	buf := make([]byte, 0, 3+1+16+2+len(payload))
-	buf = append(buf, 0x00, 0x00, 0x00) // RSV RSV FRAG
-	buf = appendAddr(buf, src)
-	buf = append(buf, byte(src.Port>>8), byte(src.Port&0xff))
-	buf = append(buf, payload...)
-	return buf
+	return dest, b[3+n:], nil
 }

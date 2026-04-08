@@ -2,6 +2,8 @@
 
 // relay.go implements bidirectional TCP data forwarding with idle-timeout
 // detection and proper TCP half-close handling.
+//
+// This file is internal to the package.
 package socks5
 
 import (
@@ -10,16 +12,16 @@ import (
 	"time"
 )
 
-// halfCloser is implemented by *net.TCPConn and any future wrapper (e.g.
-// TLS) that exposes one-directional shutdown. Using an interface instead of
-// a concrete type assertion keeps relay and gracefulClose agnostic of the
+// halfCloser is implemented by *net.TCPConn and any future wrapper (e.g. TLS)
+// that exposes one-directional shutdown. Using an interface instead of a
+// concrete type assertion keeps relay and gracefulClose agnostic of the
 // underlying transport.
 type halfCloser interface {
 	CloseWrite() error
 }
 
-// closeWrite shuts down the write side of a connection, signalling EOF to
-// the peer while still allowing reads in the opposite direction.
+// closeWrite shuts down the write side of a connection, signalling EOF to the
+// peer while still allowing reads in the opposite direction.
 func closeWrite(conn net.Conn) {
 	if hc, ok := conn.(halfCloser); ok {
 		hc.CloseWrite()
@@ -46,8 +48,8 @@ func (r *idleReader) Read(p []byte) (int, error) {
 // on the other so it receives a clean EOF without tearing down the reverse
 // direction prematurely.
 //
-// It returns the first non-nil error so a meaningful failure is not
-// swallowed when a clean EOF arrives first due to goroutine scheduling.
+// It returns the first non-nil error so a meaningful failure is not swallowed
+// when a clean EOF arrives first due to goroutine scheduling.
 func relay(client, remote net.Conn, idleTimeout time.Duration) error {
 	errc := make(chan error, 2)
 
