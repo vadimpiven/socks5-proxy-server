@@ -54,11 +54,17 @@ func newSession(conn net.Conn, srv *Server) *session {
 	}
 }
 
+// cgnatRange is the Shared Address Space defined in RFC 6598 (100.64.0.0/10).
+// Used by Tailscale, carrier-grade NAT, and cloud-internal networks.
+// Go's netip.Addr.IsPrivate() only covers RFC 1918; this fills the gap.
+var cgnatRange = netip.MustParsePrefix("100.64.0.0/10")
+
 // isPrivateAddr reports whether addr falls into a non-routable address range
 // that should not be reachable via a public SOCKS5 proxy.
 func isPrivateAddr(addr netip.Addr) bool {
 	ip := addr.Unmap()
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsUnspecified() || cgnatRange.Contains(ip)
 }
 
 // handle drives the full SOCKS5 session pipeline to completion.
@@ -91,8 +97,8 @@ func (s *session) handle(ctx context.Context) {
 	// Block CONNECT to private/loopback/link-local destinations unless the
 	// allowPrivate callback permits it for this user. The check applies
 	// only to CONNECT: UDP ASSOCIATE's DST.ADDR is a client source-address
-	// hint (RFC 1928 §7), not a forwarding target. Domain destinations are
-	// passed through because DNS has not yet resolved.
+	// hint (RFC 1928 §7), not a forwarding target. Domain destinations
+	// are checked post-dial in handleConnect once the IP is resolved.
 	if cmd == CommandConnect && dest.IP.IsValid() && isPrivateAddr(dest.IP) {
 		allow := s.srv.allowPrivate
 		if allow == nil || !allow(s.identity) {
@@ -224,6 +230,22 @@ func (s *session) handleConnect(ctx context.Context, dest AddrSpec) {
 		return
 	}
 	defer remote.Close()
+
+	// Post-dial private-destination check: domain names (ATYP 0x03) skip the
+	// pre-dial check because DNS has not yet resolved. Now that the connection
+	// is established we can inspect the resolved IP and block it if the user
+	// lacks AllowPrivate. The outbound connection is closed via defer.
+	if allow := s.srv.allowPrivate; allow == nil || !allow(s.identity) {
+		if tcp, ok := remote.RemoteAddr().(*net.TCPAddr); ok {
+			ip, _ := netip.AddrFromSlice(tcp.IP)
+			if ip.IsValid() && isPrivateAddr(ip.Unmap()) {
+				_ = writeReply(s.conn, replyNotAllowed, AddrSpec{})
+				s.log.Info("request denied: private destination (resolved)", "target", dest, "resolved", ip)
+				gracefulClose(s.conn)
+				return
+			}
+		}
+	}
 
 	// Report the actual bound address to the client (RFC 1928 §6).
 	// Use a safe assertion: a custom DialFunc may return a non-TCP conn

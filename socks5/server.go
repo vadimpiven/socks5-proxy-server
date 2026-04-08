@@ -109,10 +109,6 @@ type Config struct {
 	// destinations is always permitted (no per-user policy is available).
 	// Use [Users] when you need granular private-destination control.
 	//
-	// Note: DOMAINNAME destinations (ATYP 0x03) are not filtered because
-	// DNS resolution has not yet occurred at request time. Use a validating
-	// [DialFunc] to protect against DNS-based SSRF.
-	//
 	// Mutually exclusive with Users: providing both is an error.
 	// At least one of Users or Authenticator must be set.
 	Authenticator Authenticator

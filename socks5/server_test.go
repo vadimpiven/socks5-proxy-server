@@ -585,6 +585,7 @@ func TestUserAllowPrivateFalse_BlocksPrivateConnect(t *testing.T) {
 		{"IPv4 RFC1918 10.x", addrTypeIPv4, []byte{10, 0, 0, 1}},
 		{"IPv4 RFC1918 192.168.x", addrTypeIPv4, []byte{192, 168, 1, 1}},
 		{"IPv4 link-local", addrTypeIPv4, []byte{169, 254, 169, 254}},
+		{"IPv4 CGNAT", addrTypeIPv4, []byte{100, 100, 100, 100}},
 		// IPv6 addresses (16 bytes)
 		{"IPv6 loopback ::1", addrTypeIPv6, func() []byte { a := make([]byte, 16); a[15] = 1; return a }()},
 		{"IPv6 ULA fc00::1", addrTypeIPv6, func() []byte { a := make([]byte, 16); a[0] = 0xfc; a[15] = 1; return a }()},
@@ -595,6 +596,33 @@ func TestUserAllowPrivateFalse_BlocksPrivateConnect(t *testing.T) {
 			connectAndExpectBlockedAuth(t, proxyAddr, "u", "p", tc.atyp, tc.addr, 80)
 		})
 	}
+}
+
+// TestUserAllowPrivateFalse_BlocksDomainToPrivate verifies that a domain name
+// resolving to a private IP is blocked post-dial when AllowPrivate=false.
+// This prevents DNS-based SSRF (e.g. Tailscale MagicDNS names resolving to
+// 100.x.y.z CGNAT addresses).
+func TestUserAllowPrivateFalse_BlocksDomainToPrivate(t *testing.T) {
+	t.Parallel()
+
+	// Start an echo server on loopback — the resolved IP will be 127.0.0.1.
+	echo := startEchoServer(t)
+	defer echo.Close()
+
+	_, portStr, _ := net.SplitHostPort(echo.Addr().String())
+
+	proxyAddr, cancel := startProxy(t, Config{
+		Users: map[string]User{"u": {Password: "p"}}, // AllowPrivate defaults to false
+	})
+	defer cancel()
+
+	// Send CONNECT with ATYP=0x03 (domain) pointing to "localhost".
+	// The proxy will dial localhost, which resolves to 127.0.0.1, and must
+	// reject it post-dial because the user lacks AllowPrivate.
+	domain := "localhost"
+	addr := append([]byte{byte(len(domain))}, domain...)
+	port, _ := net.LookupPort("tcp", portStr)
+	connectAndExpectBlockedAuth(t, proxyAddr, "u", "p", addrTypeDomain, addr, uint16(port))
 }
 
 // TestNoAuth_PermitsPrivateDestinations verifies that Authenticator mode

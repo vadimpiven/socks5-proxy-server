@@ -65,6 +65,9 @@ func TestIsPrivateAddr_BlockedRanges(t *testing.T) {
 		"192.168.1.1",     // RFC 1918
 		"169.254.169.254", // link-local (AWS metadata service)
 		"169.254.0.1",     // link-local
+		"100.64.0.1",      // CGNAT / Shared Address Space (RFC 6598, Tailscale)
+		"100.100.100.100", // CGNAT interior
+		"100.127.255.254", // CGNAT upper bound
 		"0.0.0.0",         // unspecified
 		"::1",             // IPv6 loopback
 		"fc00::1",         // IPv6 ULA
@@ -87,6 +90,8 @@ func TestIsPrivateAddr_AllowedRanges(t *testing.T) {
 	public := []string{
 		"1.1.1.1",
 		"8.8.8.8",
+		"100.63.255.255", // just below CGNAT range (100.64.0.0/10)
+		"100.128.0.0",    // just above CGNAT range
 		"203.0.113.1",
 		"2606:4700:4700::1111",
 		"2001:db8::1",

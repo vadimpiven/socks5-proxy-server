@@ -69,20 +69,14 @@ share the same field names.
 ### Username/password authentication
 
 ```go
-ctx, stop := signal.NotifyContext(context.Background(),
-    syscall.SIGINT, syscall.SIGTERM)
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 defer stop()
 
 srv, err := socks5.NewServer(socks5.Config{
     Users: map[string]socks5.User{
-        // Explicit login — client sends "xK9mW2pQ":
         "alice": {Login: "xK9mW2pQ", Password: "s3cr3t", AllowPrivate: true},
-        // Login omitted — defaults to "bob":
-        "bob": {Password: "hunter2"},
+        "bob":   {Password: "hunter2"},
     },
-    // Dial: myDialer.DialContext,      // proxy chaining, TLS, metrics
-    // BindAddr: "203.0.113.1",         // pin outbound IP (mutex with Dial)
-    // TrustedIPs: []netip.Addr{...},   // bypass auth for these clients
 })
 if err != nil {
     log.Fatal(err)
