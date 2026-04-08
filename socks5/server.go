@@ -4,27 +4,20 @@
 //
 // # Quick start
 //
-// The simplest server accepts all connections without authentication:
+// Callers must explicitly select an authentication mode.
 //
-//	srv, _ := socks5.NewServer(socks5.Config{})
-//	srv.ListenAndServe(ctx, ":1080")
-//
-// Add username/password authentication with a single call:
+// No authentication:
 //
 //	srv, _ := socks5.NewServer(socks5.Config{
-//	    Authenticators: []socks5.Authenticator{
-//	        socks5.UserPassAuth("alice", "s3cr3t"),
-//	    },
+//	    Authenticator: socks5.NoAuthAuthenticator{},
 //	})
 //
-// Support multiple users:
+// Username/password authentication:
 //
 //	srv, _ := socks5.NewServer(socks5.Config{
-//	    Authenticators: []socks5.Authenticator{
-//	        socks5.UserPassAuthMulti(map[string]string{
-//	            "alice": "s3cr3t",
-//	            "bob":   "hunter2",
-//	        }),
+//	    Users: map[string]socks5.User{
+//	        "alice": {Password: "s3cr3t", AllowPrivate: true},
+//	        "bob":   {Password: "hunter2"},
 //	    },
 //	})
 //
@@ -43,12 +36,12 @@
 //
 // # Access control
 //
-// [Config.AllowPrivateDestinations] governs whether CONNECT requests to
-// private, loopback, and link-local addresses are permitted. When nil
-// (default), all such connections receive reply 0x02 (not allowed),
-// protecting against SSRF attacks. The callback receives the authenticated
-// identity (username for RFC 1929, empty string for NoAuth) and returns
-// true to permit private destinations for that user.
+// When [Config.Users] is set, [User.AllowPrivate] governs per-user CONNECT
+// access to private, loopback, and link-local addresses. Clients that bypass
+// authentication via [Config.TrustedIPs] are always permitted (they are
+// trusted). When [Config.Authenticator] is set (including [NoAuthAuthenticator]),
+// all private destinations are permitted — use [Config.Users] for granular
+// control.
 //
 // # Extension points
 //
@@ -88,40 +81,41 @@ const (
 // Config holds all settings for a SOCKS5 server. All fields are read-only
 // after being passed to [NewServer].
 //
-// A zero-value Config starts a proxy that requires no authentication and
-// blocks CONNECT to private, loopback, and link-local IP destinations
-// ([AllowPrivateDestinations] defaults to nil). Set [AllowPrivateDestinations]
-// to permit specific users to reach internal infrastructure.
+// Callers must explicitly select an authentication mode by setting exactly
+// one of [Users] or [Authenticator]. Use [NoAuthAuthenticator] to accept
+// unauthenticated connections:
+//
+//	socks5.Config{Authenticator: socks5.NoAuthAuthenticator{}}
 type Config struct {
 	// Logger receives all server-level and session-level log output.
 	// Defaults to [slog.Default] when nil.
 	Logger *slog.Logger
 
-	// Authenticators is the ordered list of authentication methods offered to
-	// clients. The server selects the first method the client also supports.
+	// Users enables username/password authentication (RFC 1929).
+	// Each key is a human-readable identifier; [User.Login] is the actual
+	// SOCKS5 credential (defaults to the key if empty).
+	// [User.AllowPrivate] controls per-user access to private destinations.
 	//
-	// For most servers, set exactly one entry using [UserPassAuth]:
-	//
-	//   Authenticators: []socks5.Authenticator{socks5.UserPassAuth("alice", "s3cr3t")}
-	//
-	// Leave nil (or empty) to accept unauthenticated connections.
-	Authenticators []Authenticator
+	// Mutually exclusive with Authenticator: providing both is an error.
+	// At least one of Users or Authenticator must be set.
+	Users map[string]User
 
-	// AllowPrivateDestinations controls whether CONNECT requests to private,
-	// loopback, and link-local IP addresses (RFC 1918, 127.0.0.0/8,
-	// 169.254.0.0/16, fc00::/7, fe80::/10, etc.) are permitted.
+	// Authenticator provides a custom authentication method (LDAP,
+	// database-backed, etc.), replacing the built-in username/password
+	// auth. Use [NoAuthAuthenticator] to accept unauthenticated
+	// connections.
 	//
-	// The callback receives the authenticated identity (username for RFC 1929,
-	// empty string for NoAuth) and returns true to allow the connection.
+	// When Authenticator is set, CONNECT to private/loopback/link-local
+	// destinations is always permitted (no per-user policy is available).
+	// Use [Users] when you need granular private-destination control.
 	//
-	// When nil (default), all private-destination connections are rejected
-	// with reply 0x02 (not allowed), protecting internet-facing proxies
-	// against SSRF attacks.
+	// Note: DOMAINNAME destinations (ATYP 0x03) are not filtered because
+	// DNS resolution has not yet occurred at request time. Use a validating
+	// [DialFunc] to protect against DNS-based SSRF.
 	//
-	// Note: DOMAINNAME destinations (ATYP 0x03) are not filtered by this
-	// callback because DNS resolution has not yet occurred at request time.
-	// Use a validating [DialFunc] to protect against DNS-based SSRF.
-	AllowPrivateDestinations func(identity string) bool
+	// Mutually exclusive with Users: providing both is an error.
+	// At least one of Users or Authenticator must be set.
+	Authenticator Authenticator
 
 	// Resolver resolves domain names for the UDP ASSOCIATE relay path.
 	// TCP CONNECT lets [Dial] handle DNS internally.
@@ -142,9 +136,10 @@ type Config struct {
 	BindAddr string
 
 	// TrustedIPs lists client source addresses that bypass authentication even
-	// when Authenticators require credentials. This is a static allowlist
-	// evaluated at request time; it cannot be modified after [NewServer] returns.
-	// IPv4 and IPv4-mapped IPv6 forms are normalised before comparison.
+	// when Users or Authenticator require credentials. This is a static
+	// allowlist evaluated at request time; it cannot be modified after
+	// [NewServer] returns. IPv4 and IPv4-mapped IPv6 forms are normalised
+	// before comparison.
 	TrustedIPs []netip.Addr
 
 	// MaxConns limits concurrent client connections. Zero means 1024.
@@ -182,6 +177,13 @@ type Server struct {
 	dial     DialFunc
 	resolver Resolver
 
+	// authenticators is built from Config.Users or Config.Authenticator.
+	authenticators []Authenticator
+
+	// allowPrivate is built from Config.Users or Config.Authenticator.
+	// nil means "deny all private destinations".
+	allowPrivate func(identity string) bool
+
 	// trustedIPs is a read-only set built from cfg.TrustedIPs in NewServer.
 	// Because it is never written after construction, concurrent reads from
 	// session goroutines are safe without a mutex.
@@ -201,10 +203,20 @@ type serverTimeouts struct {
 // in defaults for nil interface fields and zero timeout values.
 //
 // Returns an error when:
+//   - Neither Users nor Authenticator is set.
+//   - Both Users and Authenticator are set (mutually exclusive).
 //   - Both Dial and BindAddr are set (mutually exclusive).
 //   - BindAddr is non-empty but not a valid IP address.
-//   - A [UserPassAuthenticator] has a nil [CredentialStore].
+//   - A user in Users has an empty Password.
+//   - Two users in Users resolve to the same Login.
+//   - Authenticator is a [UserPassAuthenticator] with a nil [CredentialStore].
 func NewServer(cfg Config) (*Server, error) {
+	if len(cfg.Users) == 0 && cfg.Authenticator == nil {
+		return nil, fmt.Errorf("socks5: set Users for password auth or Authenticator for custom auth (use NoAuthAuthenticator{} for unauthenticated access)")
+	}
+	if len(cfg.Users) > 0 && cfg.Authenticator != nil {
+		return nil, fmt.Errorf("socks5: Users and Authenticator are mutually exclusive; provide one or the other")
+	}
 	if cfg.Dial != nil && cfg.BindAddr != "" {
 		return nil, fmt.Errorf("socks5: Dial and BindAddr are mutually exclusive; provide one or the other")
 	}
@@ -212,9 +224,6 @@ func NewServer(cfg Config) (*Server, error) {
 	// Interface defaults.
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
-	}
-	if len(cfg.Authenticators) == 0 {
-		cfg.Authenticators = []Authenticator{NoAuthAuthenticator{}}
 	}
 	if cfg.Resolver == nil {
 		cfg.Resolver = DefaultResolver{}
@@ -249,12 +258,48 @@ func NewServer(cfg Config) (*Server, error) {
 		to.dns = defaultDNSTimeout
 	}
 
-	// Validate every UserPassAuthenticator upfront to avoid a nil-dereference
-	// panic on the first authentication attempt.
-	for i, a := range cfg.Authenticators {
-		if upa, ok := a.(UserPassAuthenticator); ok && upa.Credentials == nil {
-			return nil, fmt.Errorf("socks5: Authenticators[%d] (UserPassAuthenticator) has a nil Credentials store", i)
+	// Build authenticators and allowPrivate from Config.
+	var (
+		authenticators []Authenticator
+		allowPrivate   func(string) bool
+	)
+
+	switch {
+	case len(cfg.Users) > 0:
+		creds := make(mapCredentials, len(cfg.Users))
+		privateSet := make(map[string]bool, len(cfg.Users))
+		seen := make(map[string]string, len(cfg.Users)) // login → id
+
+		for id, u := range cfg.Users {
+			login := u.Login
+			if login == "" {
+				login = id
+			}
+			if u.Password == "" {
+				return nil, fmt.Errorf("socks5: user %q has empty password", id)
+			}
+			if prevID, dup := seen[login]; dup {
+				return nil, fmt.Errorf("socks5: duplicate login %q (users %q and %q)", login, prevID, id)
+			}
+			seen[login] = id
+			creds[login] = u.Password
+			privateSet[login] = u.AllowPrivate
 		}
+
+		authenticators = []Authenticator{UserPassAuthenticator{Credentials: creds}}
+		allowPrivate = func(identity string) bool {
+			if v, ok := privateSet[identity]; ok {
+				return v
+			}
+			return true // trusted-IP bypass: trusted = allow all
+		}
+
+	default: // cfg.Authenticator != nil (guaranteed by validation above)
+		if upa, ok := cfg.Authenticator.(UserPassAuthenticator); ok && upa.Credentials == nil {
+			return nil, fmt.Errorf("socks5: Authenticator (UserPassAuthenticator) has a nil Credentials store")
+		}
+		authenticators = []Authenticator{cfg.Authenticator}
+		allowPrivate = func(string) bool { return true } // no per-user policy
 	}
 
 	// Build the outbound dialer when the caller has not provided one.
@@ -283,12 +328,14 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:        cfg,
-		sem:        make(chan struct{}, cfg.MaxConns),
-		timeouts:   to,
-		dial:       dial,
-		resolver:   cfg.Resolver,
-		trustedIPs: trusted,
+		cfg:            cfg,
+		sem:            make(chan struct{}, cfg.MaxConns),
+		timeouts:       to,
+		dial:           dial,
+		resolver:       cfg.Resolver,
+		authenticators: authenticators,
+		allowPrivate:   allowPrivate,
+		trustedIPs:     trusted,
 	}, nil
 }
 

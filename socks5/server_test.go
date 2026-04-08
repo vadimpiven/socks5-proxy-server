@@ -88,7 +88,7 @@ func TestFullSession_NoAuth_Connect(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
@@ -110,8 +110,9 @@ func TestFullSession_UserPass_Connect(t *testing.T) {
 	defer echo.Close()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators:           []Authenticator{UserPassAuth("user", "pass")},
-		AllowPrivateDestinations: func(string) bool { return true },
+		Users: map[string]User{
+			"user": {Password: "pass", AllowPrivate: true},
+		},
 	})
 	defer cancel()
 
@@ -137,7 +138,9 @@ func TestFullSession_UserPass_Connect(t *testing.T) {
 func TestFullSession_AuthFailure(t *testing.T) {
 	t.Parallel()
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
+		Users: map[string]User{
+			"user": {Password: "pass"},
+		},
 	})
 	defer cancel()
 
@@ -177,10 +180,9 @@ func TestFullSession_AuthFailure(t *testing.T) {
 // BIND, which is not implemented.
 func TestFullSession_UnsupportedCommand(t *testing.T) {
 	t.Parallel()
-	// AllowPrivateDestinations: BIND targets 127.0.0.1, so private-IP filtering
-	// must be disabled to let the request reach the command-dispatch switch,
-	// which replies 0x07 (command not supported).
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	// NoAuth mode permits private destinations, so the BIND request to
+	// 127.0.0.1 reaches the command-dispatch switch, which replies 0x07.
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -209,7 +211,7 @@ func TestFullSession_UnsupportedCommand(t *testing.T) {
 // the target port is not listening.
 func TestFullSession_ConnectionRefused(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -236,7 +238,7 @@ func TestGracefulShutdown(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 
 	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
 
@@ -256,7 +258,7 @@ func TestGracefulShutdown(t *testing.T) {
 // TestGreeting_WrongVersion verifies RFC 1928 §3: VER must be 0x05.
 func TestGreeting_WrongVersion(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -283,7 +285,7 @@ func TestGreeting_WrongVersion(t *testing.T) {
 // with method byte 0xFF, followed by a server-initiated connection close.
 func TestGreeting_ZeroNMethods(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -313,7 +315,7 @@ func TestGreeting_ZeroNMethods(t *testing.T) {
 // produce reply 0x01 (general failure) and close the connection.
 func TestRequest_NonZeroRSV(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -348,7 +350,7 @@ func TestRequest_NonZeroRSV(t *testing.T) {
 // produce reply 0x08 (address type not supported).
 func TestRequest_UnknownATYP(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -379,8 +381,8 @@ func TestConnect_DomainName(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
-	// AllowPrivateDestinations: "localhost" resolves to 127.0.0.1 (loopback).
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	// NoAuth mode: "localhost" resolves to 127.0.0.1 (loopback), always permitted.
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	_, portStr, _ := net.SplitHostPort(echo.Addr().String())
@@ -422,7 +424,7 @@ func TestConnect_IPv6(t *testing.T) {
 		}
 	}()
 
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	// Dial through proxy to [::1]:port.
@@ -444,7 +446,7 @@ func TestConnect_IPv6(t *testing.T) {
 // The VER check runs inside readRequest() before rules are consulted.
 func TestRequest_WrongVersion(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -470,7 +472,7 @@ func TestConnect_BNDAddrPort(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -525,10 +527,10 @@ func TestConnect_BNDAddrPort(t *testing.T) {
 	}
 }
 
-// connectAndExpectBlocked dials the proxy, completes the NoAuth greeting, sends
-// a CONNECT to the given raw address bytes (ATYP + addr + port), and asserts
-// that the proxy returns reply 0x02 (not allowed) followed by a connection close.
-func connectAndExpectBlocked(t *testing.T, proxyAddr string, atyp byte, addrBytes []byte, port uint16) {
+// connectAndExpectBlockedAuth dials the proxy, authenticates with user/pass,
+// sends a CONNECT to the given raw address bytes, and asserts reply 0x02
+// (not allowed) followed by a connection close.
+func connectAndExpectBlockedAuth(t *testing.T, proxyAddr, user, pass string, atyp byte, addrBytes []byte, port uint16) {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
@@ -537,18 +539,20 @@ func connectAndExpectBlocked(t *testing.T, proxyAddr string, atyp byte, addrByte
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	conn.Write([]byte{version5, 0x01, methodNoAuth})
+	conn.Write([]byte{version5, 0x01, methodUserPass})
+	io.ReadFull(conn, make([]byte, 2))
+
+	auth := []byte{authSubVersion, byte(len(user))}
+	auth = append(auth, user...)
+	auth = append(auth, byte(len(pass)))
+	auth = append(auth, pass...)
+	conn.Write(auth)
 	io.ReadFull(conn, make([]byte, 2))
 
 	req := append([]byte{version5, byte(CommandConnect), 0x00, atyp}, addrBytes...)
 	req = binary.BigEndian.AppendUint16(req, port)
 	conn.Write(req)
 
-	// Failure replies always use a zero AddrSpec, which encodes as ATYP=IPv4
-	// 0.0.0.0:0: VER(1)+REP(1)+RSV(1)+ATYP(1)+addr(4)+port(2) = 10 bytes.
-	// Reading the full reply before checking for close is required; reading
-	// fewer bytes would leave BND.ADDR/PORT in the TCP buffer, causing the
-	// subsequent Read to return those bytes rather than EOF.
 	reply := make([]byte, 10)
 	if _, err := io.ReadFull(conn, reply); err != nil {
 		t.Fatalf("read failure reply: %v", err)
@@ -562,12 +566,14 @@ func connectAndExpectBlocked(t *testing.T, proxyAddr string, atyp byte, addrByte
 	}
 }
 
-// TestDefaultConfig_BlocksPrivateConnect verifies that the default config
-// (AllowPrivateDestinations=nil) blocks CONNECT to several categories of
-// private/reserved addresses across both IPv4 and IPv6.
-func TestDefaultConfig_BlocksPrivateConnect(t *testing.T) {
+// TestUserAllowPrivateFalse_BlocksPrivateConnect verifies that a user with
+// AllowPrivate=false (default) is blocked from CONNECT to several categories
+// of private/reserved addresses across both IPv4 and IPv6.
+func TestUserAllowPrivateFalse_BlocksPrivateConnect(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{}) // default: deny private
+	proxyAddr, cancel := startProxy(t, Config{
+		Users: map[string]User{"u": {Password: "p"}}, // AllowPrivate defaults to false
+	})
 	defer cancel()
 
 	cases := []struct {
@@ -586,18 +592,18 @@ func TestDefaultConfig_BlocksPrivateConnect(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			connectAndExpectBlocked(t, proxyAddr, tc.atyp, tc.addr, 80)
+			connectAndExpectBlockedAuth(t, proxyAddr, "u", "p", tc.atyp, tc.addr, 80)
 		})
 	}
 }
 
-// TestAllowPrivateDestinations_PermitsLoopback verifies that an
-// AllowPrivateDestinations callback returning true allows CONNECT to loopback.
-func TestAllowPrivateDestinations_PermitsLoopback(t *testing.T) {
+// TestNoAuth_PermitsPrivateDestinations verifies that Authenticator mode
+// (including NoAuth) always permits CONNECT to private/loopback addresses.
+func TestNoAuth_PermitsPrivateDestinations(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
-	proxyAddr, cancel := startProxy(t, Config{AllowPrivateDestinations: func(string) bool { return true }})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
@@ -620,9 +626,10 @@ func TestTrustedIPs_BypassAuth(t *testing.T) {
 	defer echo.Close()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators:           []Authenticator{UserPassAuth("user", "pass")},
-		TrustedIPs:               []netip.Addr{netip.MustParseAddr("127.0.0.1")},
-		AllowPrivateDestinations: func(string) bool { return true },
+		Users: map[string]User{
+			"user": {Password: "pass", AllowPrivate: true},
+		},
+		TrustedIPs: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 	})
 	defer cancel()
 
@@ -643,8 +650,10 @@ func TestTrustedIPs_UnknownIPRequiresAuth(t *testing.T) {
 	t.Parallel()
 	// Trust only 10.0.0.1; the test client arrives from 127.0.0.1.
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("user", "pass")},
-		TrustedIPs:     []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+		Users: map[string]User{
+			"user": {Password: "pass"},
+		},
+		TrustedIPs: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 	})
 	defer cancel()
 
@@ -671,18 +680,39 @@ func TestTrustedIPs_UnknownIPRequiresAuth(t *testing.T) {
 // invalid configuration before the server starts accepting connections.
 func TestNewServer_ValidationErrors(t *testing.T) {
 	t.Parallel()
+	t.Run("neither Users nor Authenticator set", func(t *testing.T) {
+		_, err := NewServer(Config{})
+		if err == nil {
+			t.Fatal("expected error when neither Users nor Authenticator is set")
+		}
+	})
+
 	t.Run("Dial and BindAddr mutually exclusive", func(t *testing.T) {
 		_, err := NewServer(Config{
-			Dial:     (&net.Dialer{}).DialContext,
-			BindAddr: "127.0.0.1",
+			Authenticator: NoAuthAuthenticator{},
+			Dial:          (&net.Dialer{}).DialContext,
+			BindAddr:      "127.0.0.1",
 		})
 		if err == nil {
 			t.Fatal("expected error when both Dial and BindAddr are set")
 		}
 	})
 
+	t.Run("Users and Authenticator mutually exclusive", func(t *testing.T) {
+		_, err := NewServer(Config{
+			Users:         map[string]User{"u": {Password: "p"}},
+			Authenticator: NoAuthAuthenticator{},
+		})
+		if err == nil {
+			t.Fatal("expected error when both Users and Authenticator are set")
+		}
+	})
+
 	t.Run("invalid BindAddr", func(t *testing.T) {
-		_, err := NewServer(Config{BindAddr: "not-an-ip"})
+		_, err := NewServer(Config{
+			Authenticator: NoAuthAuthenticator{},
+			BindAddr:      "not-an-ip",
+		})
 		if err == nil {
 			t.Fatal("expected error for non-IP BindAddr")
 		}
@@ -690,10 +720,43 @@ func TestNewServer_ValidationErrors(t *testing.T) {
 
 	t.Run("nil Credentials in UserPassAuthenticator", func(t *testing.T) {
 		_, err := NewServer(Config{
-			Authenticators: []Authenticator{UserPassAuthenticator{Credentials: nil}},
+			Authenticator: UserPassAuthenticator{Credentials: nil},
 		})
 		if err == nil {
 			t.Fatal("expected error for UserPassAuthenticator with nil Credentials")
+		}
+	})
+
+	t.Run("empty password in Users", func(t *testing.T) {
+		_, err := NewServer(Config{
+			Users: map[string]User{"alice": {Password: ""}},
+		})
+		if err == nil {
+			t.Fatal("expected error for empty password")
+		}
+	})
+
+	t.Run("duplicate login in Users", func(t *testing.T) {
+		_, err := NewServer(Config{
+			Users: map[string]User{
+				"alice":    {Login: "shared", Password: "a"},
+				"bob":      {Login: "shared", Password: "b"},
+			},
+		})
+		if err == nil {
+			t.Fatal("expected error for duplicate login")
+		}
+	})
+
+	t.Run("login defaults to key", func(t *testing.T) {
+		_, err := NewServer(Config{
+			Users: map[string]User{
+				"alice": {Password: "a"}, // login defaults to "alice"
+				"bob":   {Login: "alice", Password: "b"},
+			},
+		})
+		if err == nil {
+			t.Fatal("expected error for duplicate login (one defaulted from key)")
 		}
 	})
 }
@@ -702,7 +765,7 @@ func TestNewServer_ValidationErrors(t *testing.T) {
 // [Config.MaxConns] by closing them immediately without any SOCKS5 data.
 func TestMaxConns_Limit(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{MaxConns: 1})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}, MaxConns: 1})
 	defer cancel()
 
 	// Establish the first connection and confirm the session is live (semaphore
@@ -747,7 +810,7 @@ func TestMaxConns_Limit(t *testing.T) {
 // and documents the omission. The correct observable behaviour is still X'FF'.
 func TestGreeting_OnlyGSSAPIMethod(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
@@ -771,20 +834,22 @@ func TestGreeting_OnlyGSSAPIMethod(t *testing.T) {
 	}
 }
 
-// TestNegotiation_ServerPriorityOverClient verifies RFC 1928 §3: the server
+// TestNegotiation_ServerPicksOwnPriority verifies RFC 1928 §3: the server
 // selects from the client's methods according to the SERVER'S own priority
-// order (first match in Config.Authenticators), not the client's order.
+// order, not the client's order.
 //
-// Scenario A: server has [UserPass]; client offers [NoAuth, UserPass].
-// Server must select UserPass (its first and only authenticator), ignoring
-// that NoAuth appears first in the client's list.
+// Scenario: server has [UserPass] (via Users); client offers [NoAuth, UserPass].
+// Server must select UserPass (its only authenticator), ignoring that NoAuth
+// appears first in the client's list.
 func TestNegotiation_ServerPicksOwnPriority(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("u", "p")},
+		Users: map[string]User{
+			"u": {Password: "p"},
+		},
 	})
 	defer cancel()
 
@@ -812,41 +877,6 @@ func TestNegotiation_ServerPicksOwnPriority(t *testing.T) {
 	io.ReadFull(conn, make([]byte, 2))
 }
 
-// TestNegotiation_ServerPicksFirstAuthenticator verifies that when the server
-// has multiple authenticators configured, it picks the FIRST one the client
-// also supports.
-//
-// Scenario B: server has [NoAuth, UserPass]; client offers [UserPass, NoAuth].
-// Server must select NoAuth (its first authenticator), even though UserPass
-// appears first in the client's METHOD list.
-func TestNegotiation_ServerPicksFirstAuthenticator(t *testing.T) {
-	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{
-		// Explicit NoAuth before UserPass — server priority trumps client order.
-		Authenticators: []Authenticator{NoAuthAuthenticator{}, UserPassAuth("u", "p")},
-	})
-	defer cancel()
-
-	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	// Client advertises UserPass first, then NoAuth.
-	conn.Write([]byte{version5, 0x02, methodUserPass, methodNoAuth})
-
-	resp := make([]byte, 2)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		t.Fatalf("read method selection: %v", err)
-	}
-	// Server must pick NoAuth (first in its own list).
-	if resp[1] != methodNoAuth {
-		t.Fatalf("METHOD = %#x, want 0x00 (NoAuth): server must use its own priority", resp[1])
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RFC 1928 §6 / §7: reply address validation
 // ---------------------------------------------------------------------------
@@ -857,8 +887,8 @@ func TestNegotiation_ServerPicksFirstAuthenticator(t *testing.T) {
 func TestUDPAssociate_BNDAddrPort(t *testing.T) {
 	t.Parallel()
 	// DenyPrivateDestinations (default) passes UDP ASSOCIATE unconditionally;
-	// no explicit Rules override needed.
-	proxyAddr, cancel := startProxy(t, Config{})
+	// no explicit policy override needed.
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	ctrl, relayAddr := doUDPAssociate(t, proxyAddr)
@@ -886,8 +916,8 @@ func TestRelay_TCPIdleTimeout(t *testing.T) {
 
 	const idleTimeout = 150 * time.Millisecond
 	proxyAddr, cancel := startProxy(t, Config{
-		TCPIdleTimeout:           idleTimeout,
-		AllowPrivateDestinations: func(string) bool { return true },
+		Authenticator:  NoAuthAuthenticator{},
+		TCPIdleTimeout: idleTimeout,
 	})
 	defer cancel()
 
@@ -914,6 +944,7 @@ func TestRelay_UDPIdleTimeout(t *testing.T) {
 	t.Parallel()
 	const idleTimeout = 150 * time.Millisecond
 	proxyAddr, cancel := startProxy(t, Config{
+		Authenticator:  NoAuthAuthenticator{},
 		UDPIdleTimeout: idleTimeout,
 	})
 	defer cancel()
@@ -939,7 +970,7 @@ func TestRelay_UDPIdleTimeout(t *testing.T) {
 func TestAuthSubNeg_WrongVersion(t *testing.T) {
 	t.Parallel()
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("u", "p")},
+		Users: map[string]User{"u": {Password: "p"}},
 	})
 	defer cancel()
 
@@ -967,7 +998,7 @@ func TestAuthSubNeg_WrongVersion(t *testing.T) {
 func TestAuthSubNeg_ZeroULEN(t *testing.T) {
 	t.Parallel()
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("u", "p")},
+		Users: map[string]User{"u": {Password: "p"}},
 	})
 	defer cancel()
 
@@ -1002,7 +1033,7 @@ func TestAuthSubNeg_ZeroULEN(t *testing.T) {
 func TestAuthSubNeg_ZeroPLEN(t *testing.T) {
 	t.Parallel()
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{UserPassAuth("u", "p")},
+		Users: map[string]User{"u": {Password: "p"}},
 	})
 	defer cancel()
 
@@ -1033,26 +1064,20 @@ func TestAuthSubNeg_ZeroPLEN(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-user AllowPrivateDestinations policy
+// Per-user AllowPrivate policy
 // ---------------------------------------------------------------------------
 
-// TestPerUserPrivatePolicy verifies that the AllowPrivateDestinations callback
-// receives the authenticated identity and correctly allows or denies private
-// destinations on a per-user basis.
+// TestPerUserPrivatePolicy verifies that the per-user AllowPrivate field
+// correctly allows or denies private destinations on a per-user basis.
 func TestPerUserPrivatePolicy(t *testing.T) {
 	t.Parallel()
 	echo := startEchoServer(t)
 	defer echo.Close()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{
-			UserPassAuthMulti(map[string]string{
-				"allowed": "pass",
-				"denied":  "pass",
-			}),
-		},
-		AllowPrivateDestinations: func(identity string) bool {
-			return identity == "allowed"
+		Users: map[string]User{
+			"allowed": {Password: "pass", AllowPrivate: true},
+			"denied":  {Password: "pass"},
 		},
 	})
 	defer cancel()
@@ -1107,20 +1132,25 @@ func TestPerUserPrivatePolicy(t *testing.T) {
 	}
 }
 
-// TestPerUserPrivatePolicy_NoAuth verifies that when AllowPrivateDestinations
-// is non-nil, NoAuth sessions pass identity="" to the callback.
-func TestPerUserPrivatePolicy_NoAuth(t *testing.T) {
+// TestNoAuth_PermitsAllPrivateAddresses verifies that in no-auth mode (Authenticator),
+// anonymous connections to private destinations are always permitted.
+func TestNoAuth_PermitsAllPrivateAddresses(t *testing.T) {
 	t.Parallel()
-
-	// Callback denies empty identity — anonymous users cannot reach private.
-	proxyAddr, cancel := startProxy(t, Config{
-		AllowPrivateDestinations: func(identity string) bool {
-			return identity != ""
-		},
-	})
+	echo := startEchoServer(t)
+	defer echo.Close()
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
-	connectAndExpectBlocked(t, proxyAddr, addrTypeIPv4, []byte{127, 0, 0, 1}, 80)
+	conn := dialThroughProxy(t, proxyAddr, nil, echo.Addr().String())
+	conn.Write([]byte("noauth-private"))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "noauth-private" {
+		t.Fatalf("got %q, want %q", buf[:n], "noauth-private")
+	}
 }
 
 // TestHandshakeTimeout verifies that the server disconnects a client that
@@ -1129,6 +1159,7 @@ func TestHandshakeTimeout(t *testing.T) {
 	t.Parallel()
 
 	proxyAddr, cancel := startProxy(t, Config{
+		Authenticator:    NoAuthAuthenticator{},
 		HandshakeTimeout: 200 * time.Millisecond,
 	})
 	defer cancel()
@@ -1152,16 +1183,14 @@ func TestHandshakeTimeout(t *testing.T) {
 }
 
 // TestFullSession_AuthFailure_MultiUser verifies that wrong credentials are
-// rejected through the full wire protocol when using UserPassAuthMulti.
+// rejected through the full wire protocol when using multiple users.
 func TestFullSession_AuthFailure_MultiUser(t *testing.T) {
 	t.Parallel()
 
 	proxyAddr, cancel := startProxy(t, Config{
-		Authenticators: []Authenticator{
-			UserPassAuthMulti(map[string]string{
-				"alice": "s3cr3t",
-				"bob":   "hunter2",
-			}),
+		Users: map[string]User{
+			"alice": {Password: "s3cr3t"},
+			"bob":   {Password: "hunter2"},
 		},
 	})
 	defer cancel()
@@ -1206,7 +1235,7 @@ func TestFullSession_AuthFailure_MultiUser(t *testing.T) {
 func TestGreeting_MaxNMethods(t *testing.T) {
 	t.Parallel()
 
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
@@ -1234,5 +1263,101 @@ func TestGreeting_MaxNMethods(t *testing.T) {
 	}
 	if resp[1] != methodNoAuth {
 		t.Fatalf("METHOD = %#x, want 0x00 (NoAuth)", resp[1])
+	}
+}
+
+// TestLoginDefaultsToKey verifies that User.Login defaults to the map key
+// when left empty, and that authentication works with the defaulted login.
+func TestLoginDefaultsToKey(t *testing.T) {
+	t.Parallel()
+	echo := startEchoServer(t)
+	defer echo.Close()
+
+	proxyAddr, cancel := startProxy(t, Config{
+		Users: map[string]User{
+			"alice": {Password: "s3cr3t", AllowPrivate: true}, // login defaults to "alice"
+		},
+	})
+	defer cancel()
+
+	conn := dialThroughProxy(t, proxyAddr,
+		&proxy.Auth{User: "alice", Password: "s3cr3t"},
+		echo.Addr().String())
+
+	conn.Write([]byte("defaulted-login"))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "defaulted-login" {
+		t.Fatalf("got %q, want %q", buf[:n], "defaulted-login")
+	}
+}
+
+// TestExplicitLogin verifies that User.Login overrides the map key for
+// authentication.
+func TestExplicitLogin(t *testing.T) {
+	t.Parallel()
+	echo := startEchoServer(t)
+	defer echo.Close()
+
+	proxyAddr, cancel := startProxy(t, Config{
+		Users: map[string]User{
+			"admin-label": {Login: "token123", Password: "s3cr3t", AllowPrivate: true},
+		},
+	})
+	defer cancel()
+
+	// Authenticate with Login ("token123"), not the map key ("admin-label").
+	conn := dialThroughProxy(t, proxyAddr,
+		&proxy.Auth{User: "token123", Password: "s3cr3t"},
+		echo.Addr().String())
+
+	conn.Write([]byte("explicit-login"))
+	buf := make([]byte, 64)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != "explicit-login" {
+		t.Fatalf("got %q, want %q", buf[:n], "explicit-login")
+	}
+}
+
+// TestExplicitLogin_KeyDoesNotAuth verifies that when Login is set, the map
+// key cannot be used to authenticate.
+func TestExplicitLogin_KeyDoesNotAuth(t *testing.T) {
+	t.Parallel()
+
+	proxyAddr, cancel := startProxy(t, Config{
+		Users: map[string]User{
+			"admin-label": {Login: "token123", Password: "s3cr3t"},
+		},
+	})
+	defer cancel()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	conn.Write([]byte{version5, 0x01, methodUserPass})
+	io.ReadFull(conn, make([]byte, 2))
+
+	// Try to authenticate with the map key, not the Login.
+	user := "admin-label"
+	pass := "s3cr3t"
+	authReq := []byte{authSubVersion, byte(len(user))}
+	authReq = append(authReq, user...)
+	authReq = append(authReq, byte(len(pass)))
+	authReq = append(authReq, pass...)
+	conn.Write(authReq)
+
+	authResp := make([]byte, 2)
+	io.ReadFull(conn, authResp)
+	if authResp[1] != authFailure {
+		t.Fatalf("STATUS = %#x, want %#x: map key must not work as login when Login is set", authResp[1], authFailure)
 	}
 }

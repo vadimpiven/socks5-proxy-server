@@ -89,12 +89,12 @@ func (s *session) handle(ctx context.Context) {
 	}
 
 	// Block CONNECT to private/loopback/link-local destinations unless the
-	// AllowPrivateDestinations callback permits it for this user. The check
-	// applies only to CONNECT: UDP ASSOCIATE's DST.ADDR is a client
-	// source-address hint (RFC 1928 §7), not a forwarding target. Domain
-	// destinations are passed through because DNS has not yet resolved.
+	// allowPrivate callback permits it for this user. The check applies
+	// only to CONNECT: UDP ASSOCIATE's DST.ADDR is a client source-address
+	// hint (RFC 1928 §7), not a forwarding target. Domain destinations are
+	// passed through because DNS has not yet resolved.
 	if cmd == CommandConnect && dest.IP.IsValid() && isPrivateAddr(dest.IP) {
-		allow := s.srv.cfg.AllowPrivateDestinations
+		allow := s.srv.allowPrivate
 		if allow == nil || !allow(s.identity) {
 			_ = writeReply(s.conn, replyNotAllowed, AddrSpec{})
 			s.log.Info("request denied: private destination", "target", dest)
@@ -154,7 +154,7 @@ func (s *session) negotiateAuth() (string, error) {
 		selected = NoAuthAuthenticator{}
 	}
 	if selected == nil {
-		for _, a := range s.srv.cfg.Authenticators {
+		for _, a := range s.srv.authenticators {
 			if slices.Contains(methods, a.Code()) {
 				selected = a
 				break

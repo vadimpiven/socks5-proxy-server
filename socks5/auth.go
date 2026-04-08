@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// auth.go provides authentication helpers, the [Authenticator] and
-// [CredentialStore] interfaces, and their built-in implementations.
+// auth.go provides the [Authenticator] and [CredentialStore] interfaces and
+// their built-in implementations.
 //
-// Most servers only need [UserPassAuth] (single user) or [UserPassAuthMulti]
-// (multiple users). Use [UserPassAuthenticator] directly only when you need a
-// custom [CredentialStore]. Implement [Authenticator] only for a completely
-// different auth scheme.
+// Most servers only need [Config.Users]. Use [UserPassAuthenticator] directly
+// when you need a custom [CredentialStore] (LDAP, database, etc.).
+// Implement [Authenticator] for a completely different auth scheme.
 package socks5
 
 import (
@@ -18,33 +17,21 @@ import (
 	"net"
 )
 
-// UserPassAuth returns an [Authenticator] for username/password authentication
-// (RFC 1929) with a single fixed credential pair.
+// User holds credentials and per-user policy for username/password
+// authentication (RFC 1929).
 //
-//	cfg.Authenticators = []socks5.Authenticator{socks5.UserPassAuth("alice", "s3cr3t")}
-//
-// For multiple users, use [UserPassAuthMulti]. For a custom credential store,
-// use [UserPassAuthenticator] directly.
-func UserPassAuth(username, password string) Authenticator {
-	return UserPassAuthenticator{
-		Credentials: StaticCredentials{Username: username, Password: password},
-	}
-}
-
-// UserPassAuthMulti returns an [Authenticator] for username/password
-// authentication (RFC 1929) accepting any credential pair in creds
-// (username → password).
-//
-//	cfg.Authenticators = []socks5.Authenticator{
-//	    socks5.UserPassAuthMulti(map[string]string{
-//	        "alice": "s3cr3t",
-//	        "bob":   "hunter2",
-//	    }),
-//	}
-//
-// For a single user, [UserPassAuth] is simpler.
-func UserPassAuthMulti(credentials map[string]string) Authenticator {
-	return UserPassAuthenticator{Credentials: MapCredentials(credentials)}
+// In [Config.Users] the map key is a human-readable identifier (never sent
+// over the wire). Login is the actual SOCKS5 credential and defaults to the
+// map key when empty.
+type User struct {
+	// Login is the SOCKS5 username (UNAME) sent by the client.
+	// Defaults to the map key in [Config.Users] when empty.
+	Login string `toml:"login"`
+	// Password is the SOCKS5 password (PASSWD). Required; must not be empty.
+	Password string `toml:"password"`
+	// AllowPrivate permits this user to CONNECT to private, loopback,
+	// and link-local IP destinations.
+	AllowPrivate bool `toml:"allow_private"`
 }
 
 // Authenticator handles a single SOCKS5 authentication method.
@@ -57,8 +44,8 @@ func UserPassAuthMulti(credentials map[string]string) Authenticator {
 // or an empty string for anonymous methods such as NoAuth. The identity is
 // used for logging; the server closes the connection on any non-nil error.
 //
-// For username/password authentication, use [UserPassAuth] or
-// [UserPassAuthMulti] instead of implementing this interface.
+// For username/password authentication, use [Config.Users] instead of
+// implementing this interface.
 type Authenticator interface {
 	// Code returns the SOCKS5 method byte this authenticator handles.
 	Code() byte
@@ -70,7 +57,8 @@ type Authenticator interface {
 
 // NoAuthAuthenticator implements SOCKS5 method 0x00 (no authentication).
 // The sub-negotiation is empty; Authenticate returns immediately.
-// This is the default when [Config.Authenticators] is nil.
+// This is the default when [Config.Users] is nil and [Config.Authenticator]
+// is nil.
 type NoAuthAuthenticator struct{}
 
 func (NoAuthAuthenticator) Code() byte { return methodNoAuth }
@@ -82,8 +70,9 @@ func (NoAuthAuthenticator) Authenticate(_ net.Conn) (string, error) {
 // UserPassAuthenticator implements RFC 1929 username/password authentication
 // (SOCKS5 method 0x02).
 //
-// Prefer [UserPassAuth] for a single user and [UserPassAuthMulti] for multiple
-// users. Use this type directly only when you need a custom [CredentialStore].
+// Most servers should use [Config.Users] instead. Use this type directly only
+// when you need a custom [CredentialStore] (LDAP, database, etc.) and pass it
+// as [Config.Authenticator].
 type UserPassAuthenticator struct {
 	// Credentials validates username/password pairs. Must not be nil;
 	// [NewServer] returns an error if it is.
@@ -103,34 +92,32 @@ func (a UserPassAuthenticator) Authenticate(conn net.Conn) (string, error) {
 
 // CredentialStore validates username/password pairs.
 // Implementations must use constant-time comparison to prevent timing attacks.
-//
-// For a single pair, use [StaticCredentials]. For multiple users, use [MapCredentials].
 type CredentialStore interface {
 	Valid(username, password string) bool
 }
 
-// StaticCredentials is a single-pair [CredentialStore]. Both comparisons are
+// staticCredentials is a single-pair [CredentialStore]. Both comparisons are
 // constant-time (SHA-256 normalised) to resist timing side-channels.
-type StaticCredentials struct {
-	Username, Password string
+type staticCredentials struct {
+	username, password string
 }
 
-func (s StaticCredentials) Valid(username, password string) bool {
+func (s staticCredentials) Valid(username, password string) bool {
 	// Assign both results before combining: if the && were applied directly
 	// to the two calls, the short-circuit would skip the password comparison
 	// when the username is wrong, leaking via timing whether the username exists.
-	userOK := constantTimeEqual([]byte(username), []byte(s.Username))
-	passOK := constantTimeEqual([]byte(password), []byte(s.Password))
+	userOK := constantTimeEqual([]byte(username), []byte(s.username))
+	passOK := constantTimeEqual([]byte(password), []byte(s.password))
 	return userOK && passOK
 }
 
-// MapCredentials is a multi-user [CredentialStore] backed by a username →
+// mapCredentials is a multi-user [CredentialStore] backed by a username →
 // password map. Map lookup is not constant-time (timing reveals whether a
 // username exists), but password comparison is. Suitable when the username
 // list is not sensitive.
-type MapCredentials map[string]string
+type mapCredentials map[string]string
 
-func (m MapCredentials) Valid(username, password string) bool {
+func (m mapCredentials) Valid(username, password string) bool {
 	stored, ok := m[username]
 	if !ok {
 		constantTimeEqual([]byte(password), nil) // dummy comparison; avoids timing oracle

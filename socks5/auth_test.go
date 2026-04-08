@@ -22,12 +22,12 @@ func pipeWithDeadline(t *testing.T) (client, server net.Conn) {
 	return c, s
 }
 
-// TestUserPassAuth verifies that [UserPassAuth] returns a working RFC 1929
-// authenticator that accepts the configured credential pair.
-func TestUserPassAuth(t *testing.T) {
+// TestUserPassAuthenticator_SingleUser verifies that a [UserPassAuthenticator]
+// with a [staticCredentials] store accepts the configured credential pair.
+func TestUserPassAuthenticator_SingleUser(t *testing.T) {
 	t.Parallel()
 	client, server := pipeWithDeadline(t)
-	auth := UserPassAuth("alice", "secret")
+	auth := UserPassAuthenticator{Credentials: staticCredentials{username: "alice", password: "secret"}}
 
 	if auth.Code() != methodUserPass {
 		t.Fatalf("Code() = %#x, want %#x (methodUserPass)", auth.Code(), methodUserPass)
@@ -56,16 +56,16 @@ func TestUserPassAuth(t *testing.T) {
 	}
 }
 
-// TestUserPassAuthMulti verifies that [UserPassAuthMulti] accepts any
-// credential pair from the provided map.
-func TestUserPassAuthMulti(t *testing.T) {
+// TestUserPassAuthenticator_MultiUser verifies that a [UserPassAuthenticator]
+// with a [mapCredentials] store accepts any credential pair from the map.
+func TestUserPassAuthenticator_MultiUser(t *testing.T) {
 	t.Parallel()
-	creds := map[string]string{"alice": "secret", "bob": "pass"}
+	creds := mapCredentials{"alice": "secret", "bob": "pass"}
 
 	for user, pass := range creds {
 		t.Run(user, func(t *testing.T) {
 			client, server := pipeWithDeadline(t)
-			auth := UserPassAuthMulti(creds)
+			auth := UserPassAuthenticator{Credentials: creds}
 
 			errc := make(chan error, 1)
 			go func() {
@@ -98,7 +98,7 @@ func TestUserPassAuthMulti(t *testing.T) {
 func TestUserPassAuth_BadSubVersion(t *testing.T) {
 	t.Parallel()
 	client, server := pipeWithDeadline(t)
-	a := UserPassAuth("u", "p")
+	a := UserPassAuthenticator{Credentials: staticCredentials{username: "u", password: "p"}}
 
 	errc := make(chan error, 1)
 	go func() {
@@ -120,7 +120,7 @@ func TestUserPassAuth_BadSubVersion(t *testing.T) {
 func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
 	t.Parallel()
 	client, server := pipeWithDeadline(t)
-	a := UserPassAuth("u", "p")
+	a := UserPassAuthenticator{Credentials: staticCredentials{username: "u", password: "p"}}
 
 	errc := make(chan error, 1)
 	go func() {
@@ -150,7 +150,7 @@ func TestUserPassAuth_ZeroLengthUsername(t *testing.T) {
 func TestUserPassAuth_ZeroLengthPassword(t *testing.T) {
 	t.Parallel()
 	client, server := pipeWithDeadline(t)
-	a := UserPassAuth("u", "p")
+	a := UserPassAuthenticator{Credentials: staticCredentials{username: "u", password: "p"}}
 
 	errc := make(chan error, 1)
 	go func() {
@@ -183,7 +183,7 @@ func TestUserPassAuth_MaxLengthCredentials(t *testing.T) {
 	longPass := strings.Repeat("p", 255)
 
 	client, server := pipeWithDeadline(t)
-	auth := UserPassAuth(longUser, longPass)
+	auth := UserPassAuthenticator{Credentials: staticCredentials{username: longUser, password: longPass}}
 
 	errc := make(chan error, 1)
 	go func() {
@@ -210,9 +210,9 @@ func TestUserPassAuth_MaxLengthCredentials(t *testing.T) {
 	}
 }
 
-func TestStaticCredentials(t *testing.T) {
+func Test_staticCredentials(t *testing.T) {
 	t.Parallel()
-	s := StaticCredentials{Username: "alice", Password: "secret"}
+	s := staticCredentials{username: "alice", password: "secret"}
 	if !s.Valid("alice", "secret") {
 		t.Error("expected valid for correct credentials")
 	}
@@ -224,9 +224,9 @@ func TestStaticCredentials(t *testing.T) {
 	}
 }
 
-func TestMapCredentials(t *testing.T) {
+func Test_mapCredentials(t *testing.T) {
 	t.Parallel()
-	m := MapCredentials{"alice": "secret", "bob": "pass"}
+	m := mapCredentials{"alice": "secret", "bob": "pass"}
 	if !m.Valid("alice", "secret") {
 		t.Error("expected valid")
 	}

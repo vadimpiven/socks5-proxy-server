@@ -75,7 +75,7 @@ func FuzzDoUserPassAuth(f *testing.F) {
 	f.Add([]byte{authSubVersion})                                                                        // truncated after VER
 	f.Add([]byte{})                                                                                      // empty
 
-	store := MapCredentials{"user": "pass"}
+	store := mapCredentials{"user": "pass"}
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		// Reads come from fuzz input; writes are discarded.

@@ -1,148 +1,131 @@
 # socks5-srv
 
-A lightweight, embeddable SOCKS5 proxy server written in Go, implementing
-[RFC 1928](rfcs/rfc1928.txt) and [RFC 1929](rfcs/rfc1929.txt).
+Lightweight, embeddable SOCKS5 proxy server in Go implementing:
 
-## Features
+- [RFC 1928](rfcs/rfc1928.txt) — SOCKS5 protocol
+- [RFC 1929](rfcs/rfc1929.txt) — username/password authentication
 
-| Feature             | Detail                                                   |
-| ------------------- | -------------------------------------------------------- |
-| Commands            | `CONNECT` (TCP tunnel), `UDP ASSOCIATE` (datagram relay) |
-| Auth methods        | No-auth (0x00), username/password (0x02)                 |
-| Address families    | IPv4, IPv6, domain names                                 |
-| Per-user policy     | Private-destination access controlled per user           |
-| Concurrency limit   | Configurable max simultaneous connections (default 1024) |
-| Graceful shutdown   | Drains active sessions before exiting                    |
-| Hot reload          | SIGHUP reloads config without dropping active sessions   |
+| Feature           | Detail                                                |
+| ----------------- | ----------------------------------------------------- |
+| Commands          | `CONNECT` (TCP), `UDP ASSOCIATE` (datagram relay)     |
+| Auth              | No-auth (0x00), username/password (0x02)              |
+| Addresses         | IPv4, IPv6, domain names                              |
+| Per-user policy   | Private-destination access controlled per user        |
+| Concurrency       | Configurable max connections (default 1024)           |
+| Graceful shutdown | Drains active sessions before exit                    |
+| Hot reload        | SIGHUP reloads config; active sessions stay open      |
+| Platforms         | Linux, macOS (CLI hot reload requires Unix signals)   |
 
-> **Not implemented:** BIND (0x02) — rejected with reply 0x07.  
-> **Not implemented:** GSSAPI (method 0x01) — absent from virtually all deployed SOCKS5 stacks.  
-> **Not implemented:** UDP fragmentation — silently dropped per RFC 1928 §7.
+Out of scope (will not be implemented):
 
-## Requirements
-
-- Go 1.26+
+- BIND command (0x02)
+- GSSAPI authentication (0x01)
+- UDP fragmentation (dropped per RFC 1928 section 7)
 
 ## Build
+
+Requires Go 1.26+.
 
 ```sh
 go build -o socks5-srv .
 ```
 
-## Usage
+## CLI
 
 ```text
 socks5-srv [flags]
-
-  -config   string   path to TOML configuration file (default "socks5-srv.toml")
-  -verbose           enable verbose log output
-  -version           print version and exit
+  -config string   path to TOML config (default "socks5-srv.toml")
+  -verbose         enable verbose log output
+  -version         print version and exit
 ```
 
-On first run, if the config file does not exist, the server creates it with
-documented defaults and continues running. The default config enables password
-authentication with an empty user list, which denies all connections until the
-operator adds at least one user.
+On first run the server writes a default config to disk. Password
+authentication is enabled with an empty user list, so all connections
+are denied until the operator adds at least one user and reloads
+(`kill -HUP <pid>`).
 
-Send SIGHUP to reload the configuration without dropping active sessions:
-
-```sh
-kill -HUP $(pidof socks5-srv)
-```
-
-### Config file format (TOML)
+### Config file (TOML)
 
 ```toml
-# Listen address (host:port).
 addr = ":1080"
+# bind = "eth0"   # outbound interface (default: OS routing)
 
-# Network interface for outbound connections (e.g. "eth0", "en0").
-# bind = "eth0"
-
-# Presence of [users] enables username/password authentication.
-# An empty section denies all connections. Remove it for no-auth mode.
-# The key is a human-readable ID; "login" defaults to the key if omitted.
 [users]
-alice = { login = "alice", password = "s3cr3t", private = true }
-bob   = { login = "bob",   password = "hunter2" }
+# Key is an admin label (never sent over the wire).
+# "login" defaults to key if omitted.
+
+# Explicit login (e.g. a random token):
+alice = { login = "xK9mW2pQ", password = "s3cr3t", allow_private = true }
+# Login omitted — client authenticates as "bob":
+bob   = { password = "hunter2" }
+
+# Remove [users] entirely for no-auth mode.
 ```
 
-| Field      | Scope    | Description                                           |
-| ---------- | -------- | ----------------------------------------------------- |
-| `addr`     | global   | Listen address (default `":1080"`)                    |
-| `bind`     | global   | Network interface for outbound connections            |
-| `[users]`  | section  | Presence enables password auth; absence means no-auth |
-| `login`    | per-user | SOCKS5 username (defaults to the key if omitted)      |
-| `password` | per-user | SOCKS5 password (required)                            |
-| `private`  | per-user | Allow connections to private/loopback destinations    |
+| Field           | Scope    | Description                                      |
+| --------------- | -------- | ------------------------------------------------ |
+| `addr`          | global   | Listen address (default `":1080"`)               |
+| `bind`          | global   | Outbound network interface (default: OS routing) |
+| `login`         | per-user | SOCKS5 username (defaults to key)                |
+| `password`      | per-user | SOCKS5 password (required, RFC 1929)             |
+| `allow_private` | per-user | Permit CONNECT to private/loopback destinations  |
 
-### Basic usage
+## Library
 
-```sh
-./socks5-srv
-```
+The `socks5` package has zero transitive dependencies (stdlib only).
+It exposes `socks5.User` with TOML struct tags so CLI and Go code
+share the same field names.
 
-### Verbose logging
+`NewServer` requires an explicit auth mode: `Users` or
+`Authenticator`. A zero-value config is rejected.
 
-```sh
-./socks5-srv -verbose
-```
-
-### Custom config path
-
-```sh
-./socks5-srv -config /etc/socks5-srv.toml
-```
-
-## Embedding
+### Username/password authentication
 
 ```go
-import "github.com/vadimpiven/socks5-srv/socks5"
+ctx, stop := signal.NotifyContext(context.Background(),
+    syscall.SIGINT, syscall.SIGTERM)
+defer stop()
 
 srv, err := socks5.NewServer(socks5.Config{
-    Authenticators: []socks5.Authenticator{
-        socks5.UserPassAuth("alice", "s3cr3t"),
+    Users: map[string]socks5.User{
+        // Explicit login — client sends "xK9mW2pQ":
+        "alice": {Login: "xK9mW2pQ", Password: "s3cr3t", AllowPrivate: true},
+        // Login omitted — defaults to "bob":
+        "bob": {Password: "hunter2"},
     },
+    // Dial: myDialer.DialContext,      // proxy chaining, TLS, metrics
+    // BindAddr: "203.0.113.1",         // pin outbound IP (mutex with Dial)
+    // TrustedIPs: []netip.Addr{...},   // bypass auth for these clients
 })
 if err != nil {
     log.Fatal(err)
 }
-
-ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-defer stop()
-
-if err := srv.ListenAndServe(ctx, ":1080"); err != nil {
-    log.Fatal(err)
-}
+log.Fatal(srv.ListenAndServe(ctx, ":1080"))
 ```
 
-### Multiple users
+Per-user `AllowPrivate` controls CONNECT to private/loopback IPs.
+Trusted-IP bypass always permits private destinations.
+
+### No authentication
 
 ```go
-socks5.UserPassAuthMulti(map[string]string{
-    "alice": "s3cr3t",
-    "bob":   "hunter2",
+srv, err := socks5.NewServer(socks5.Config{
+    Authenticator: socks5.NoAuthAuthenticator{},
 })
 ```
 
-### Custom outbound dialer (proxy chaining, metrics, TLS)
+All private destinations are permitted. Use `Users` for granular
+per-user control.
+
+### Custom credential backend (LDAP, database)
+
+Implement `socks5.CredentialStore` (one method: `Valid(user, pass)
+bool`):
 
 ```go
-socks5.Config{
-    Dial: (&net.Dialer{LocalAddr: bindAddr}).DialContext,
-}
-```
-
-### Private-destination policy
-
-By default, CONNECT to private, loopback, and link-local addresses is blocked
-(SSRF protection). Set `AllowPrivateDestinations` to permit specific users
-(or all users) to reach internal infrastructure:
-
-```go
-socks5.Config{
-    AllowPrivateDestinations: func(identity string) bool { return true },
-}
+srv, err := socks5.NewServer(socks5.Config{
+    Authenticator: socks5.UserPassAuthenticator{Credentials: myStore},
+})
 ```
 
 ## Testing

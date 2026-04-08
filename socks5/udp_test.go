@@ -202,7 +202,7 @@ func doUDPAssociate(t *testing.T, proxyAddr string) (ctrl net.Conn, relayAddr *n
 func TestUDPAssociate_EchoRoundtrip(t *testing.T) {
 	t.Parallel()
 	echoAddr := startUDPEchoServer(t)
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	ctrl, relayAddr := doUDPAssociate(t, proxyAddr)
@@ -252,7 +252,7 @@ func TestUDPAssociate_EchoRoundtrip(t *testing.T) {
 // listen on.
 func TestUDPAssociate_PortChangingRemote(t *testing.T) {
 	t.Parallel()
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	listenConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -331,7 +331,8 @@ func TestUDPAssociate_DomainDestination(t *testing.T) {
 	// Use a resolver that always returns 127.0.0.1 so the relay stays on
 	// the same IPv4 network as the echo server and the relay socket.
 	proxyAddr, cancel := startProxy(t, Config{
-		Resolver: fixedIPResolver{netip.MustParseAddr("127.0.0.1")},
+		Authenticator: NoAuthAuthenticator{},
+		Resolver:      fixedIPResolver{netip.MustParseAddr("127.0.0.1")},
 	})
 	defer cancel()
 
@@ -425,7 +426,7 @@ func TestUDPRelay_DropsDatagramFromWrongSourceIP(t *testing.T) {
 func TestUDPAssociate_AssociationEndsWithTCP(t *testing.T) {
 	t.Parallel()
 	echoAddr := startUDPEchoServer(t)
-	proxyAddr, cancel := startProxy(t, Config{})
+	proxyAddr, cancel := startProxy(t, Config{Authenticator: NoAuthAuthenticator{}})
 	defer cancel()
 
 	ctrl, relayAddr := doUDPAssociate(t, proxyAddr)

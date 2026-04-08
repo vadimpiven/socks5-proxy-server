@@ -37,18 +37,12 @@ import (
 var version = "dev"
 
 // config is the top-level TOML configuration.
+// User entries use [socks5.User] directly so field names are shared between
+// the library API and the config file.
 type config struct {
-	Addr  string               `toml:"addr"`
-	Bind  string               `toml:"bind"`
-	Users map[string]userEntry `toml:"users"`
-}
-
-// userEntry represents one user in the [users] table.
-// The map key serves as the human-readable ID.
-type userEntry struct {
-	Login    string `toml:"login"`
-	Password string `toml:"password"`
-	Private  bool   `toml:"private"`
+	Addr  string                 `toml:"addr"`
+	Bind  string                 `toml:"bind"`
+	Users map[string]socks5.User `toml:"users"`
 }
 
 const defaultConfig = `# socks5-srv configuration
@@ -59,7 +53,7 @@ const defaultConfig = `# socks5-srv configuration
 # Listen address (host:port).
 addr = ":1080"
 
-# Network interface for outbound connections (e.g. "eth0", "en0").
+# Network interface for outbound connections (default: OS routing).
 # The server resolves the interface to an IP matching each destination's
 # address family (IPv4 or IPv6) per connection, similar to curl --interface.
 # bind = "eth0"
@@ -70,8 +64,8 @@ addr = ":1080"
 #
 # The key is a human-readable ID. If "login" is omitted it defaults to the key.
 [users]
-# alice = { login = "alice", password = "s3cr3t", private = true }
-# bob   = { login = "bob",   password = "hunter2" }
+# alice = { login = "xK9mW2pQ", password = "s3cr3t", allow_private = true }
+# bob   = { password = "hunter2" }
 `
 
 func main() {
@@ -167,6 +161,8 @@ func main() {
 }
 
 // loadConfig reads and validates the TOML configuration file.
+// User-level validation (empty passwords, duplicate logins) is handled by
+// [socks5.NewServer] so the library and CLI share the same rules.
 func loadConfig(path string) (config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -184,22 +180,6 @@ func loadConfig(path string) (config, error) {
 			return config{}, fmt.Errorf("bind interface %q: %w", cfg.Bind, err)
 		}
 	}
-	if cfg.Users != nil {
-		seen := make(map[string]string, len(cfg.Users))
-		for id, u := range cfg.Users {
-			login := u.Login
-			if login == "" {
-				login = id
-			}
-			if u.Password == "" {
-				return config{}, fmt.Errorf("user %q has empty password", id)
-			}
-			if prevID, dup := seen[login]; dup {
-				return config{}, fmt.Errorf("duplicate login %q (users %q and %q)", login, prevID, id)
-			}
-			seen[login] = id
-		}
-	}
 	return cfg, nil
 }
 
@@ -207,34 +187,14 @@ func loadConfig(path string) (config, error) {
 func buildServer(cfg config, logger *slog.Logger) (*socks5.Server, error) {
 	scfg := socks5.Config{
 		Logger: logger,
+		Users:  cfg.Users,
 	}
-
 	if cfg.Bind != "" {
 		scfg.Dial = ifaceDial(cfg.Bind)
 	}
-
-	if cfg.Users != nil {
-		creds := make(socks5.MapCredentials, len(cfg.Users))
-		privateSet := make(map[string]bool, len(cfg.Users))
-		for id, u := range cfg.Users {
-			login := u.Login
-			if login == "" {
-				login = id
-			}
-			creds[login] = u.Password
-			privateSet[login] = u.Private
-		}
-		scfg.Authenticators = []socks5.Authenticator{
-			socks5.UserPassAuthenticator{Credentials: creds},
-		}
-		scfg.AllowPrivateDestinations = func(identity string) bool {
-			return privateSet[identity]
-		}
-	} else {
-		scfg.Authenticators = []socks5.Authenticator{socks5.NoAuthAuthenticator{}}
-		scfg.AllowPrivateDestinations = func(string) bool { return true }
+	if cfg.Users == nil {
+		scfg.Authenticator = socks5.NoAuthAuthenticator{}
 	}
-
 	return socks5.NewServer(scfg)
 }
 
